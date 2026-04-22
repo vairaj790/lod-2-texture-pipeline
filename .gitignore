@@ -19,8 +19,6 @@ rectification/
 *.png
 *.jpg
 *.jpeg
-*.tif
-*.tiff
 *.npz
 *.onnx
 .DS_Store

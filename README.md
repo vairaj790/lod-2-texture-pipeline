@@ -44,7 +44,7 @@ At a high level, each building goes through these stages:
 The pipeline expects two synchronized input collections:
 
 - `3d_geojsons/*.geojson`
-  One GeoJSON per building. These are 3D wireframe-style building descriptions in `EPSG:25832`.
+  One GeoJSON per building. These are 3D wireframe-style building descriptions in 'EPSG:25832'.
 - `geotiffs/*.tif` or `*.tiff`
   One roof raster per building. Filenames are matched against the GeoJSON basename, with `_3d` stripped from the GeoJSON stem when needed.
 
@@ -65,24 +65,9 @@ For each input building, the pipeline creates a folder inside `OUTPUT_DIR` conta
 - `viewer_bundle.npz`
 - the final textured `glb`
 
-## Repository Layout
-
-- `run_batch.py`: batch entrypoint
-- `single_test.py`: process a single GeoJSON/GeoTIFF pair
-- `lod2_texture_pipeline/config.py`: default paths, API key slot, prompts, and tuning constants
-- `lod2_texture_pipeline/pipeline.py`: batch orchestration and per-building processing
-- `lod2_texture_pipeline/geojson_io.py`: GeoJSON loading and loop grouping
-- `lod2_texture_pipeline/streetview.py`: Street View search, pano scoring, and image download
-- `lod2_texture_pipeline/projection.py`: camera math, wall projection, SAM3 loading, rectification, and mosaic coverage logic
-- `lod2_texture_pipeline/quadfit.py`: mask cleanup, quad fitting, Hough line analysis, and refinement
-- `lod2_texture_pipeline/inpainting.py`: LaMa ONNX inpainting helpers
-- `lod2_texture_pipeline/mesh.py`: wall/roof/base mesh construction and roof masking
-- `lod2_texture_pipeline/utils.py`: naming helpers, overlays, and viewer bundle export
-- `lama_model/`: expected location of the LaMa ONNX checkpoint
-
 ## Requirements
 
-The code relies on three kinds of dependencies:
+The pipeline relies on three kinds of dependencies:
 
 - Python packages for geospatial IO, geometry, deep learning, and mesh export
 - model assets that are not installed from `pip`
@@ -212,7 +197,7 @@ The sample files in `sample_data/3d_geojsons/` show the intended structure.
 
 ## Reproducibility Notes
 
-- The code currently assumes CRS `EPSG:25832` and converts to `EPSG:4326` for Street View queries.
+- The pipeline currently assumes CRS `EPSG:25832` and converts to `EPSG:4326` for Street View queries.
 - Paths are configured as absolute paths by default; for a public deployment you will usually want to override them locally.
 - SAM3 weights are not bundled in this repository.
 - The LaMa ONNX file is referenced by path and is not installed automatically.
