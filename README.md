@@ -80,26 +80,6 @@ Use either:
 - `requirements.txt` for a `pip`-based setup, or
 - `environment.yml` for a Conda setup
 
-The Python dependencies used by this repository are:
-
-- `numpy==1.26.4`
-- `pandas==3.0.1`
-- `geopandas==1.1.2`
-- `shapely==2.0.2`
-- `pyproj==3.7.2`
-- `rasterio==1.5.0`
-- `requests==2.32.5`
-- `Pillow==12.0.0`
-- `opencv==5.0.0alpha`
-- `torch==2.7.0`
-- `trimesh==4.11.5`
-- `scipy==1.17.1`
-- `matplotlib`
-- `fiona`
-- `sam3==0.1.0`
-
-These dependency versions were checked against the working `sam3_texture_lama_test` environment used to run the pipeline, together with the repository imports and execution path.
-
 ### External Assets And Services
 
 You also need:
