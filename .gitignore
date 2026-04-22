@@ -24,3 +24,4 @@ rectification/
 *.npz
 *.onnx
 .DS_Store
+.codex
