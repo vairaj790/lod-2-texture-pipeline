@@ -1,24 +1,15 @@
-# Core numerical / ML
-numpy==1.24.3
-pandas==2.0.3
-scipy==1.11.1
-torch==2.2.2
-
-# Imaging / visualization
-Pillow==9.4.0
-opencv-python-headless==4.9.0.80
-matplotlib==3.7.2
-
-# HTTP
-requests==2.31.0
-
-# Geospatial / geometry / mesh
-geopandas
-shapely
-pyproj
-rasterio
+numpy==1.26.4
+pandas==3.0.1
+geopandas==1.1.2
+shapely==2.0.2
+pyproj==3.7.2
+rasterio==1.5.0
+requests==2.32.5
+Pillow==12.0.0
+opencv-python-headless
+torch==2.7.0
+trimesh==4.11.5
+scipy==1.17.1
+matplotlib
 fiona
-trimesh
-
-# Segmentation
-sam3
+sam3==0.1.0

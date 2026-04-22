@@ -80,27 +80,25 @@ Use either:
 - `requirements.txt` for a `pip`-based setup, or
 - `environment.yml` for a Conda setup
 
-The core packages used directly by the code are:
+The Python dependencies used by this repository are:
 
-- `numpy`
-- `pandas`
-- `geopandas`
-- `shapely`
-- `pyproj`
-- `rasterio`
-- `requests`
-- `Pillow`
-- `opencv-python-headless`
-- `torch`
-- `trimesh`
-- `scipy`
+- `numpy==1.26.4`
+- `pandas==3.0.1`
+- `geopandas==1.1.2`
+- `shapely==2.0.2`
+- `pyproj==3.7.2`
+- `rasterio==1.5.0`
+- `requests==2.32.5`
+- `Pillow==12.0.0`
+- `opencv==5.0.0alpha`
+- `torch==2.7.0`
+- `trimesh==4.11.5`
+- `scipy==1.17.1`
 - `matplotlib`
 - `fiona`
-- `sam3`
+- `sam3==0.1.0`
 
-Note:
-
-- In the current local Python interpreter, `numpy`, `requests`, `Pillow`, `opencv-python-headless`, `torch`, `scipy`, `matplotlib`, and `pandas` are installed, but key repo dependencies such as `geopandas`, `shapely`, `pyproj`, `rasterio`, `trimesh`, `fiona`, and `sam3` are not currently available. The updated environment files below are therefore based on code inspection plus the partial local environment.
+These dependency versions were checked against the working `sam3_texture_lama_test` environment used to run the pipeline, together with the repository imports and execution path.
 
 ### External Assets And Services
 
