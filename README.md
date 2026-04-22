@@ -84,7 +84,7 @@ Use either:
 
 You also need:
 
-- a Google Street View Static API key with billing enabled
+- a Google Street View Static API key
 - the SAM3 package and its model weights
 - the LaMa ONNX checkpoint at `lama_model/inpainting_lama_2025jan.onnx`
 
@@ -176,10 +176,9 @@ The sample files in `sample_data/3d_geojsons/` show the intended structure.
 ## Reproducibility Notes
 
 - The pipeline currently assumes CRS `EPSG:25832` and converts to `EPSG:4326` for Street View queries.
-- Paths are configured as absolute paths by default; for a public deployment you will usually want to override them locally.
 - SAM3 weights are not bundled in this repository.
 - The LaMa ONNX file is referenced by path and is not installed automatically.
-- Google Street View requests depend on API quota, billing, and imagery availability.
+- Google Street View requests depend on API
 - CPU execution is possible in principle, but SAM3 inference is likely to be much slower than GPU execution.
 
 ## Known Limitations
@@ -188,9 +187,3 @@ The sample files in `sample_data/3d_geojsons/` show the intended structure.
 - The repo assumes one roof GeoTIFF per building and filename-based matching.
 - The segmentation prompts are fixed-text defaults and may need tuning for new regions or datasets.
 - The current packaging documents the `sam3` dependency, but users may still need to align installation with the specific SAM3 distribution they use.
-
-## Recommended Citation / Description For GitHub
-
-If you want a short repo description for GitHub, this is a good summary:
-
-`Pipeline for converting 3D GeoJSON building wireframes plus roof GeoTIFFs and Google Street View imagery into textured LoD2 GLB building models using SAM3 facade segmentation, orthorectification, and LaMa inpainting.`
