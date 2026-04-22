@@ -1,0 +1,12 @@
+numpy
+geopandas
+shapely
+pyproj
+requests
+Pillow
+opencv-python
+torch
+trimesh
+rasterio
+scipy
+matplotlib
