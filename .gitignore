@@ -12,6 +12,7 @@ __pycache__/
 output/
 outputs/
 inputs/
+sam3/
 lod2_texture_pipeline/config_local.py
 sam3_mesh_search_retrieve_stitch_segment_rectify_bake.py
 rectification/

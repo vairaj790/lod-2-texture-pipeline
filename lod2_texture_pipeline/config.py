@@ -4,9 +4,9 @@
 import pyproj
 
 # ======================= USER CONFIG (BATCH) =======================
-GEOJSON_DIR = r"/home/fo37nor/assets/lod2_texture_pipeline_repo/sample_data/3d_geojsons/singles"
-GEOTIFF_DIR = r"/home/fo37nor/assets/lod2_texture_pipeline_repo/sample_data/geotiffs/singles"
-OUTPUT_DIR  = r"/home/fo37nor/assets/lod2_texture_pipeline_repo/outputs"
+GEOJSON_DIR = r"sample_data/3d_geojsons/singles"
+GEOTIFF_DIR = r"sample_data/geotiffs/singles"
+OUTPUT_DIR  = r"outputs"
 
 API_KEY      = ""
 MODEL_NAME   = "SAM3_PROMPT"
@@ -48,7 +48,7 @@ SAVE_RAW_OVERLAY_PNG = False
 SAVE_LR_OVERLAY_PNG = False
 
 ENABLE_LAMA_FILL = True
-LAMA_MODEL_PATH = r"/home/fo37nor/assets/lod2_texture_pipeline_repo/lama_model/inpainting_lama_2025jan.onnx"
+LAMA_MODEL_PATH = r"lama_model/inpainting_lama_2025jan.onnx"
 LAMA_MASK_DILATE_PX = 5
 LAMA_MIN_HOLE_AREA_PX = 64
 LAMA_SAVE_DEBUG_MASK = True

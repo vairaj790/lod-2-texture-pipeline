@@ -8,7 +8,7 @@ def main():
     process_building(
         geojson_path=GEOJSON_DIR,
         geotiff_path=GEOTIFF_DIR,
-        output_dir=OUTPUT_DIR,
+        out_root=OUTPUT_DIR,
     )
 
 

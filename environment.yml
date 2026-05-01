@@ -1,24 +1,20 @@
-name: lod2-texture-pipeline
+name: lod2_texture_pipeline
 channels:
   - conda-forge
-  - pytorch
-  - defaults
 dependencies:
   - python=3.12
-  - numpy=1.26.4
-  - pandas=3.0.1
-  - geopandas=1.1.2
-  - shapely=2.0.2
-  - pyproj=3.7.2
-  - rasterio=1.5.0
-  - requests=2.32.5
-  - pillow=12.0.0
+  - numpy>=1.26,<2
+  - pandas
+  - geopandas
+  - shapely
+  - pyproj
+  - rasterio<1.5
+  - requests
+  - pillow
   - opencv
-  - pytorch=2.7.0
-  - trimesh=4.11.5
-  - scipy=1.17.1
+  - trimesh
+  - scipy
   - matplotlib
   - fiona
+  - pyogrio
   - pip
-  - pip:
-      - sam3==0.1.0
