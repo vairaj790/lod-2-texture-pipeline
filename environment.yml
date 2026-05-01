@@ -17,4 +17,10 @@ dependencies:
   - matplotlib
   - fiona
   - pyogrio
+  - setuptools<81
   - pip
+  - pip:
+      - einops
+      - pycocotools
+      - psutil
+      - "triton-windows<3.7; platform_system=='Windows'"
