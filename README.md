@@ -211,28 +211,6 @@ Then run:
 python single_test.py
 ```
 
-## Configuration Files
-
-Main public config:
-
-```text
-lod2_texture_pipeline/config.py
-```
-
-Local private override:
-
-```text
-lod2_texture_pipeline/config_local.py
-```
-
-Example local config:
-
-```text
-lod2_texture_pipeline/config_local.example.py
-```
-
-Use `config.py` for public-safe defaults and `config_local.py` for machine-specific paths, API keys, and private settings.
-
 ## Expected GeoJSON Structure
 
 The loader expects features with properties similar to:
