@@ -9,15 +9,51 @@ import numpy as np
 from PIL import Image
 
 from .config import LAMA_MASK_DILATE_PX, LAMA_MIN_HOLE_AREA_PX, LAMA_MODEL_PATH
-class OpenCVLamaInpainter:
+
+
+class OnnxRuntimeLamaInpainter:
     def __init__(self, model_path: str):
         if not os.path.exists(model_path):
-            raise FileNotFoundError(f"LaMa ONNX model not found: {model_path}")
+            raise FileNotFoundError(
+                f"LaMa ONNX model not found: {model_path}\n"
+                "Place the model at LAMA_MODEL_PATH or set ENABLE_LAMA_FILL=False."
+            )
+
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise ImportError(
+                "onnxruntime is required for LaMa inpainting. "
+                "Install it with: pip install onnxruntime"
+            ) from exc
 
         self.model_path = model_path
-        self.net = cv2.dnn.readNetFromONNX(self.model_path)
-        self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-        self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+
+        # Explicit thread settings avoid noisy pthread affinity warnings on some Linux systems.
+        sess_options = ort.SessionOptions()
+        sess_options.intra_op_num_threads = 1
+        sess_options.inter_op_num_threads = 1
+
+        # Suppress ONNX Runtime graph-cleanup warnings during LaMa model loading.
+        sess_options.log_severity_level = 3
+
+        self.session = ort.InferenceSession(
+            self.model_path,
+            sess_options=sess_options,
+            providers=["CPUExecutionProvider"],
+        )
+
+        inputs = self.session.get_inputs()
+        outputs = self.session.get_outputs()
+
+        if len(inputs) < 2:
+            raise RuntimeError("LaMa ONNX model must have at least two inputs: image and mask.")
+        if len(outputs) < 1:
+            raise RuntimeError("LaMa ONNX model must have at least one output.")
+
+        self.image_input_name = inputs[0].name
+        self.mask_input_name = inputs[1].name
+        self.output_name = outputs[0].name
 
     def infer(self, image_bgr: np.ndarray, mask_u8: np.ndarray) -> np.ndarray:
         """
@@ -30,44 +66,60 @@ class OpenCVLamaInpainter:
         if mask_u8 is None or mask_u8.ndim != 2:
             raise ValueError("mask_u8 must be HxW uint8")
 
-        image_blob = cv2.dnn.blobFromImage(
+        orig_h, orig_w = image_bgr.shape[:2]
+
+        image_512 = cv2.resize(
             image_bgr,
-            scalefactor=0.00392,
-            size=(512, 512),
-            mean=(0, 0, 0),
-            swapRB=False,
-            crop=False
-        )
+            (512, 512),
+            interpolation=cv2.INTER_LINEAR,
+        ).astype(np.float32)
 
-        mask_blob = cv2.dnn.blobFromImage(
+        mask_512 = cv2.resize(
             mask_u8,
-            scalefactor=1.0,
-            size=(512, 512),
-            mean=(0,),
-            swapRB=False,
-            crop=False
+            (512, 512),
+            interpolation=cv2.INTER_NEAREST,
         )
-        mask_blob = (mask_blob > 0).astype(np.float32)
 
-        self.net.setInput(image_blob, "image")
-        self.net.setInput(mask_blob, "mask")
-        output = self.net.forward()[0]   # 3 x H x W
+        # Keep the same input scaling as the old OpenCV-DNN implementation:
+        # image in [0, 1], mask in {0, 1}.
+        image_blob = image_512.transpose(2, 0, 1)[None, :, :, :] / 255.0
+        mask_blob = (mask_512 > 0).astype(np.float32)[None, None, :, :]
 
-        result = np.transpose(output, (1, 2, 0)).astype(np.uint8)
+        output = self.session.run(
+            [self.output_name],
+            {
+                self.image_input_name: image_blob.astype(np.float32),
+                self.mask_input_name: mask_blob.astype(np.float32),
+            },
+        )[0]
+
+        output = output[0].transpose(1, 2, 0)
+
+        # Some LaMa ONNX exports return [0, 1], some return [0, 255].
+        if float(np.nanmax(output)) <= 1.5:
+            output = output * 255.0
+
+        result = np.clip(output, 0, 255).astype(np.uint8)
+
         result = cv2.resize(
             result,
-            (image_bgr.shape[1], image_bgr.shape[0]),
-            interpolation=cv2.INTER_LINEAR
+            (orig_w, orig_h),
+            interpolation=cv2.INTER_LINEAR,
         )
+
         return result
+
 
 _LAMA_INPAINTER = None
 
-def get_lama_inpainter() -> OpenCVLamaInpainter:
+
+def get_lama_inpainter() -> OnnxRuntimeLamaInpainter:
     global _LAMA_INPAINTER
     if _LAMA_INPAINTER is None:
-        _LAMA_INPAINTER = OpenCVLamaInpainter(LAMA_MODEL_PATH)
+        _LAMA_INPAINTER = OnnxRuntimeLamaInpainter(LAMA_MODEL_PATH)
     return _LAMA_INPAINTER
+
+
 def remove_small_mask_components(mask_u8: np.ndarray, min_area_px: int) -> np.ndarray:
     if min_area_px <= 1:
         return mask_u8
@@ -82,18 +134,23 @@ def remove_small_mask_components(mask_u8: np.ndarray, min_area_px: int) -> np.nd
             cleaned[labels == lbl] = 255
 
     return cleaned
+
+
 def build_wall_region_mask(height: int, width: int, wall_poly_px: np.ndarray) -> np.ndarray:
     mask = np.zeros((height, width), dtype=np.uint8)
     poly = np.round(wall_poly_px).astype(np.int32).reshape((-1, 1, 2))
     cv2.fillPoly(mask, [poly], 255)
     return mask
+
+
 def lama_fill_rectified_wall(
     ortho_rgba: np.ndarray,
     wall_poly_px: np.ndarray,
-    debug_mask_path: Optional[str] = None
+    debug_mask_path: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Fill missing pixels inside the rectified wall polygon using LaMa.
+
     Returns:
         filled_rgba, hole_mask_u8
     """
@@ -105,7 +162,7 @@ def lama_fill_rectified_wall(
     wall_region_mask = build_wall_region_mask(H, W, wall_poly_px)
     alpha = ortho_rgba[:, :, 3]
 
-    # fill only transparent pixels inside the wall polygon
+    # Fill only transparent pixels inside the wall polygon.
     hole_mask = np.zeros((H, W), dtype=np.uint8)
     hole_mask[(wall_region_mask > 0) & (alpha == 0)] = 255
 
@@ -143,8 +200,7 @@ def lama_fill_rectified_wall(
     filled_rgba[fill_idx, :3] = result_rgb[fill_idx]
     filled_rgba[fill_idx, 3] = 255
 
-    # IMPORTANT:
-    # keep the original alpha everywhere else so the full orthorectified
+    # Keep the original alpha everywhere else so the full orthorectified
     # segmentation remains visible outside the projected wall polygon too.
 
     if debug_mask_path is not None:

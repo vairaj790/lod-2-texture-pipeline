@@ -202,7 +202,8 @@ def process_building(geojson_path: str,
 
             print(f"[c{cid} l{lid} w{k}] fetched {len(urls_fetched)} Street View image(s):")
             for u in urls_fetched:
-                print("         URL:", u)
+                safe_u = u.split("&key=")[0] + "&key=****" if "&key=" in u else u
+                print("         URL:", safe_u)
 
             wall_tag = f"c{cid}_l{lid}_w{i_global:02d}"
 

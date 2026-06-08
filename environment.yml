@@ -1,6 +1,8 @@
 name: lod2_texture_pipeline
+
 channels:
   - conda-forge
+
 dependencies:
   - python=3.12
   - numpy>=1.26,<2
@@ -18,9 +20,13 @@ dependencies:
   - fiona
   - pyogrio
   - setuptools<81
+  - libstdcxx-ng
+  - libgcc-ng
   - pip
   - pip:
       - einops
       - pycocotools
       - psutil
+      - decord
+      - onnxruntime
       - "triton-windows<3.7; platform_system=='Windows'"
