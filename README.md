@@ -98,21 +98,29 @@ Verify SAM3:
 python -c "import sam3; print('sam3 ok')"
 ```
 
-### 5. Add the LaMa ONNX model
+### 5. Download the LaMa ONNX model
 
-LaMa uses an ONNX model file. Place it here:
+LaMa is used as a separate model asset, similar to SAM3. Keep it outside the repository folder.
 
-```text
-lama_model/inpainting_lama_2025jan.onnx
-```
-
-Create the folder if needed:
+From inside `lod-2-texture-pipeline`, run:
 
 ```bash
+cd ..
 mkdir -p lama_model
+cd lama_model
+wget -O inpainting_lama_2025jan.onnx "https://huggingface.co/opencv/inpainting_lama/resolve/main/inpainting_lama_2025jan.onnx?download=true"
+cd ../lod-2-texture-pipeline
 ```
 
-The model file is not installed automatically by Conda and must be provided separately.
+After this, the expected structure is:
+
+```text
+parent_folder/
+├── lod-2-texture-pipeline/
+├── sam3/
+└── lama_model/
+    └── inpainting_lama_2025jan.onnx
+```
 
 ### 6. Configure local paths and API key
 
@@ -138,7 +146,7 @@ LOCAL_CONFIG = {
     "GEOTIFF_DIR": "sample_data/geotiffs",
     "OUTPUT_DIR": "outputs",
     "API_KEY": "YOUR_GOOGLE_STREET_VIEW_API_KEY",
-    "LAMA_MODEL_PATH": "lama_model/inpainting_lama_2025jan.onnx",
+    "LAMA_MODEL_PATH": "../lama_model/inpainting_lama_2025jan.onnx",
 }
 ```
 
@@ -243,6 +251,6 @@ The sample files in `sample_data/3d_geojsons/` show the intended structure.
 - The pipeline currently assumes CRS `EPSG:25832` and converts to `EPSG:4326` for Street View queries.
 - Google Street View requests require a valid API key.
 - SAM3 weights are downloaded/managed by SAM3 and are not bundled in this repository.
-- The LaMa ONNX model is not bundled in this repository.
+- The LaMa ONNX model is downloaded separately into a sibling `lama_model/` folder.
 - Full SAM3 inference is intended for GPU execution. CPU execution may be very slow.
 - There is no CLI yet; the workflow is controlled through `config.py`, `config_local.py`, `run_batch.py`, and `single_test.py`.

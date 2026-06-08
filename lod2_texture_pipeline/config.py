@@ -48,7 +48,7 @@ SAVE_RAW_OVERLAY_PNG = False
 SAVE_LR_OVERLAY_PNG = False
 
 ENABLE_LAMA_FILL = True
-LAMA_MODEL_PATH = r"lama_model/inpainting_lama_2025jan.onnx"
+LAMA_MODEL_PATH = r"../lama_model/inpainting_lama_2025jan.onnx"
 LAMA_MASK_DILATE_PX = 5
 LAMA_MIN_HOLE_AREA_PX = 64
 LAMA_SAVE_DEBUG_MASK = True
