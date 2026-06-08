@@ -1,4 +1,3 @@
-@'
 # LoD2 Texture Pipeline
 
 This repository builds textured LoD2 `glb` building models from:
@@ -7,45 +6,29 @@ This repository builds textured LoD2 `glb` building models from:
 - roof GeoTIFF imagery
 - Google Street View facade imagery
 
-The pipeline reconstructs each building as a set of wall, roof, and base meshes, finds suitable Street View panoramas for every wall, segments facades with SAM3, rectifies the selected facade imagery into wall-plane textures, optionally fills missing texture regions with LaMa, maps roof imagery from GeoTIFFs, and exports a textured LoD2 `glb`.
+The pipeline reconstructs each building as wall, roof, and base meshes, finds suitable Street View panoramas for facade walls, segments facades with SAM3, rectifies facade imagery into wall-plane textures, fills missing wall texture regions with LaMa, maps roof imagery from GeoTIFFs, and exports a textured LoD2 `glb`.
 
 ## What The Pipeline Does
 
 At a high level, each building goes through these stages:
 
-1. Load a 3D GeoJSON building skeleton.  
-   The GeoJSON is expected to contain `roof`, `base`, `wall`, and optional `wall_center` features. Base, roof, and wall loops are reconstructed from the edge graph.
-
-2. Search Google Street View around the footprint.  
-   A buffered search grid is generated around the building base, candidate panoramas are collected with the Street View metadata API, and duplicate or out-of-zone panos are filtered out.
-
-3. Select one best pano per wall.  
-   For each wall face, the code computes an outward-facing prism in front of the wall and chooses the most suitable panorama geometrically.
-
-4. Fetch facade imagery and ensure full wall coverage.  
-   The wall quad is projected into the selected Street View image. If one request does not cover the wall well enough, the pipeline widens the view or fetches multiple yaw/pitch tiles and stitches them into a mosaic.
-
-5. Segment facades with SAM3.  
-   SAM3 is run with separate prompts for facade and roof. The pipeline keeps the best facade instance, removes roof pixels, cleans the mask, and saves debugging overlays.
-
-6. Orthorectify the facade into wall coordinates.  
-   The segmented wall is warped from perspective image space into a metric wall-plane texture. An additional quadrilateral fit and optional Hough-guided refinement help align the texture with the expected wall geometry.
-
-7. Fill missing wall texture with LaMa.  
-   Transparent holes inside the rectified wall polygon can be filled with a LaMa ONNX model loaded through OpenCV DNN.
-
-8. Texture roofs from GeoTIFFs.  
-   Roof meshes are triangulated from the roof edges, UVs are derived from GeoTIFF coordinates, and masking is applied so each roof island receives only its own roof pixels.
-
-9. Export a textured LoD2 `glb`.  
-   The final scene is written as a `glb`, together with per-wall texture artifacts, debug overlays, and viewer metadata bundles.
+1. Load a 3D GeoJSON building skeleton.
+2. Search Google Street View around the building footprint.
+3. Select suitable panoramas for visible walls.
+4. Fetch Street View facade images.
+5. Segment facades with SAM3.
+6. Orthorectify facade imagery into wall coordinates.
+7. Fill missing wall texture regions with LaMa ONNX inpainting.
+8. Texture roofs from GeoTIFF imagery.
+9. Export the final textured LoD2 `glb`.
 
 ## Inputs
 
 The pipeline expects two synchronized input collections:
 
 - `3d_geojsons/*.geojson`  
-  One GeoJSON per building. These are 3D wireframe-style building descriptions in `EPSG:25832`.
+  One GeoJSON per building. The expected CRS is `EPSG:25832`.
+
 - `geotiffs/*.tif` or `*.tiff`  
   One roof raster per building. Filenames are matched against the GeoJSON basename, with `_3d` stripped from the GeoJSON stem when needed.
 
@@ -59,112 +42,141 @@ Sample inputs are included in:
 For each input building, the pipeline creates a folder inside `OUTPUT_DIR` containing:
 
 - rectified wall textures as PNGs
-- per-wall JSON metadata describing camera pose and rectification transforms
 - segmentation and rectification debug overlays
 - optional LaMa hole masks
+- per-wall metadata JSON files
 - `viewer_index.json`
 - `viewer_bundle.npz`
 - the final textured `glb`
-
-## Requirements
-
-The full intended workflow uses:
-
-- Python 3.12
-- the Conda environment from `environment.yml`
-- a separate PyTorch installation
-- a separate SAM3 installation
-- a Google Street View Static API key
-- the LaMa ONNX checkpoint at `lama_model/inpainting_lama_2025jan.onnx`
-
-The repository no longer uses `requirements.txt` for the main setup.
 
 ## Installation
 
 ### 1. Clone this repository
 
-    git clone https://github.com/vairaj790/lod-2-texture-pipeline.git
-    cd lod-2-texture-pipeline
+```bash
+git clone https://github.com/vairaj790/lod-2-texture-pipeline.git
+cd lod-2-texture-pipeline
+```
 
-### 2. Create the base environment
+### 2. Create the Conda environment
 
-    conda env create -f environment.yml
-    conda activate lod2_texture_pipeline
+```bash
+conda env create -f environment.yml
+conda activate lod2_texture_pipeline
+```
 
-### 3. Install PyTorch separately
+### 3. Install PyTorch
 
-    pip install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu128
+This is the tested PyTorch setup used for the current pipeline:
 
-### 4. Install SAM3 separately
+```bash
+pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128
+```
 
-Clone SAM3 next to this repository folder and install it in editable mode:
+Verify it:
 
-    git clone https://github.com/facebookresearch/sam3.git
-    cd sam3
-    pip install -e .
-    cd ..
+```bash
+python -c "import torch, torchvision; print(torch.__version__); print(torch.version.cuda); print(torchvision.__version__); print(torch.cuda.is_available())"
+```
 
-### 5. Install additional packages required for the full SAM3 import path
+### 4. Install SAM3
 
-    pip install "setuptools<81" einops pycocotools psutil
+SAM3 is installed separately from the official repository. Use the pinned commit below:
 
-On Windows only:
+```bash
+cd ..
+git clone https://github.com/facebookresearch/sam3.git
+cd sam3
+git checkout 11dec2936de97f2857c1f76b66d982d5a001155d
+pip install .
+cd ../lod-2-texture-pipeline
+```
 
-    pip install "triton-windows<3.7"
+Verify SAM3:
 
-### 6. Verify the installation
+```bash
+python -c "import sam3; print('sam3 ok')"
+```
 
-    python -c "import numpy, rasterio, torch, torchvision, sam3, lod2_texture_pipeline; print('repo import ok')"
+### 5. Add the LaMa ONNX model
 
-## Configuration
+LaMa uses an ONNX model file. Place it here:
 
-The repo uses a code-first configuration style.
+```text
+lama_model/inpainting_lama_2025jan.onnx
+```
 
-### Main config
+Create the folder if needed:
 
-Runtime defaults and pipeline parameters live in:
+```bash
+mkdir -p lama_model
+```
 
-- `lod2_texture_pipeline/config.py`
+The model file is not installed automatically by Conda and must be provided separately.
 
-This file should remain public-safe and generic.
+### 6. Configure local paths and API key
 
-### Local private override
+Do not put private paths or API keys directly into `config.py`.
 
-Machine-specific paths and secrets should go in:
+Create a local override file:
 
-- `lod2_texture_pipeline/config_local.py`
+```bash
+cp lod2_texture_pipeline/config_local.example.py lod2_texture_pipeline/config_local.py
+```
 
-This file is ignored by Git and can override any uppercase variable from `config.py`.
+Edit:
 
-An example template is provided in:
+```text
+lod2_texture_pipeline/config_local.py
+```
 
-- `lod2_texture_pipeline/config_local.example.py`
+Typical local overrides are:
 
-Typical local overrides include:
+```python
+LOCAL_CONFIG = {
+    "GEOJSON_DIR": "sample_data/3d_geojsons",
+    "GEOTIFF_DIR": "sample_data/geotiffs",
+    "OUTPUT_DIR": "outputs",
+    "API_KEY": "YOUR_GOOGLE_STREET_VIEW_API_KEY",
+    "LAMA_MODEL_PATH": "lama_model/inpainting_lama_2025jan.onnx",
+}
+```
 
-- `GEOJSON_DIR`
-- `GEOTIFF_DIR`
-- `OUTPUT_DIR`
-- `API_KEY`
-- `LAMA_MODEL_PATH`
+`config_local.py` is ignored by Git.
 
-## Minimal Setup Checklist
+## Linux Shared-Library Note
 
-Before running the pipeline, make sure:
+On some Linux systems, compiled packages may accidentally load older system libraries instead of Conda libraries. If you see an error similar to:
 
-1. Your Google Street View API key is set in `config_local.py`.
-2. The LaMa checkpoint exists at `LAMA_MODEL_PATH`.
-3. SAM3 is installed and importable.
-4. Your batch input folders are set correctly in `config.py` or `config_local.py`.
-5. Your sample or test files actually exist at the paths you are using.
+```text
+GLIBCXX_3.4.29 not found
+```
+
+run:
+
+```bash
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+```
+
+Then retry the command.
+
+## Verify The Installation
+
+After installing the environment, PyTorch, SAM3, and placing the LaMa ONNX file, run:
+
+```bash
+python -c "import numpy, rasterio, geopandas, torch, torchvision, sam3, onnxruntime, lod2_texture_pipeline; print('repo import ok')"
+```
 
 ## How To Run
 
 ### Batch mode
 
-Batch mode uses the folder-based settings from `config.py` and optional overrides from `config_local.py`.
+Batch mode uses folder paths from `config.py` and optional overrides from `config_local.py`.
 
-    python run_batch.py
+```bash
+python run_batch.py
+```
 
 The batch runner:
 
@@ -178,9 +190,40 @@ The batch runner:
 
 `single_test.py` is for testing one building only.
 
-For this script, edit the single input file paths directly inside `single_test.py` before running it.
+It uses one explicit GeoJSON file and one explicit GeoTIFF file. Edit these paths inside `single_test.py` before running:
 
-    python single_test.py
+```python
+GEOJSON_PATH = REPO_ROOT / "sample_data" / "3d_geojsons" / "building_48959353_3d.geojson"
+GEOTIFF_PATH = REPO_ROOT / "sample_data" / "geotiffs" / "building_48959353.tif"
+```
+
+Then run:
+
+```bash
+python single_test.py
+```
+
+## Configuration Files
+
+Main public config:
+
+```text
+lod2_texture_pipeline/config.py
+```
+
+Local private override:
+
+```text
+lod2_texture_pipeline/config_local.py
+```
+
+Example local config:
+
+```text
+lod2_texture_pipeline/config_local.example.py
+```
+
+Use `config.py` for public-safe defaults and `config_local.py` for machine-specific paths, API keys, and private settings.
 
 ## Expected GeoJSON Structure
 
@@ -195,18 +238,11 @@ The loader expects features with properties similar to:
 
 The sample files in `sample_data/3d_geojsons/` show the intended structure.
 
-## Reproducibility Notes
+## Notes
 
 - The pipeline currently assumes CRS `EPSG:25832` and converts to `EPSG:4326` for Street View queries.
-- SAM3 weights are not bundled in this repository.
-- The LaMa ONNX file is referenced by path and is not installed automatically.
-- Google Street View requests depend on API access.
-- CPU execution is possible in principle, but SAM3 inference is likely to be much slower than GPU execution.
-
-## Known Limitations
-
-- There is no CLI yet; the workflow is controlled through `config.py`, `config_local.py`, and `single_test.py`.
-- The repo assumes one roof GeoTIFF per building and filename-based matching.
-- The segmentation prompts are fixed-text defaults and may need tuning for new regions or datasets.
-- SAM3 is installed separately and may require platform-specific dependency handling.
-'@ | Set-Content README.md
+- Google Street View requests require a valid API key.
+- SAM3 weights are downloaded/managed by SAM3 and are not bundled in this repository.
+- The LaMa ONNX model is not bundled in this repository.
+- Full SAM3 inference is intended for GPU execution. CPU execution may be very slow.
+- There is no CLI yet; the workflow is controlled through `config.py`, `config_local.py`, `run_batch.py`, and `single_test.py`.
