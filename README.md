@@ -64,6 +64,27 @@ cd lod-2-texture-pipeline
 conda env create -f environment.yml
 conda activate lod2_texture_pipeline
 ```
+## Linux Library Note
+
+On some Linux systems, if a GLIBCXX/libstdc++ error appears, install the Conda runtime libraries with:
+
+```bash
+conda install -c conda-forge libstdcxx-ng libgcc-ng
+```
+
+ALso, compiled packages may accidentally load older system libraries instead of Conda libraries. If you see an error similar to:
+
+```text
+GLIBCXX_3.4.29 not found
+```
+
+run:
+
+```bash
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+```
+
+Then retry the command.
 
 ### 3. Install PyTorch
 
@@ -151,22 +172,6 @@ LOCAL_CONFIG = {
 ```
 
 `config_local.py` is ignored by Git.
-
-## Linux Shared-Library Note
-
-On some Linux systems, compiled packages may accidentally load older system libraries instead of Conda libraries. If you see an error similar to:
-
-```text
-GLIBCXX_3.4.29 not found
-```
-
-run:
-
-```bash
-export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
-```
-
-Then retry the command.
 
 ## Verify The Installation
 

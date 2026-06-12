@@ -20,8 +20,6 @@ dependencies:
   - fiona
   - pyogrio
   - setuptools<81
-  - libstdcxx-ng
-  - libgcc-ng
   - pip
   - pip:
       - einops
