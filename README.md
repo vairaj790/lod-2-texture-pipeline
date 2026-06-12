@@ -72,7 +72,7 @@ On some Linux systems, if a GLIBCXX/libstdc++ error appears, install the Conda r
 conda install -c conda-forge libstdcxx-ng libgcc-ng
 ```
 
-ALso, compiled packages may accidentally load older system libraries instead of Conda libraries. If you see an error similar to:
+Also, compiled packages may accidentally load older system libraries instead of Conda libraries. If you see an error similar to:
 
 ```text
 GLIBCXX_3.4.29 not found
