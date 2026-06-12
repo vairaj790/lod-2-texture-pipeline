@@ -112,7 +112,11 @@ git checkout 11dec2936de97f2857c1f76b66d982d5a001155d
 pip install .
 cd ../lod-2-texture-pipeline
 ```
+SAM3 downloads its model weights from the gated Hugging Face repository `facebook/sam3`. Request access to that model on Hugging Face and log in locally:
 
+```bash
+hf auth login
+```
 Verify SAM3:
 
 ```bash
