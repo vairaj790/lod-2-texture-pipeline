@@ -97,7 +97,7 @@ pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytor
 Verify it:
 
 ```bash
-python -c "import torch, torchvision; print(torch.__version__); print(torch.version.cuda); print(torchvision.__version__); print(torch.cuda.is_available())"
+python -c "from PIL import Image; import torch, torchvision; print(torch.__version__); print(torch.version.cuda); print(torchvision.__version__); print(torch.cuda.is_available())"
 ```
 
 ### 4. Install SAM3
@@ -116,7 +116,7 @@ cd ../lod-2-texture-pipeline
 Verify SAM3:
 
 ```bash
-python -c "import sam3; print('sam3 ok')"
+python -c "from PIL import Image; import sam3; print('sam3 ok')"
 ```
 
 ### 5. Download the LaMa ONNX model
@@ -178,7 +178,7 @@ LOCAL_CONFIG = {
 After installing the environment, PyTorch, SAM3, and placing the LaMa ONNX file, run:
 
 ```bash
-python -c "import numpy, rasterio, geopandas, torch, torchvision, sam3, onnxruntime, lod2_texture_pipeline; print('repo import ok')"
+python -c "from PIL import Image; import numpy, rasterio, geopandas, torch, torchvision, sam3, onnxruntime, lod2_texture_pipeline; print('repo import ok')"
 ```
 
 ## How To Run

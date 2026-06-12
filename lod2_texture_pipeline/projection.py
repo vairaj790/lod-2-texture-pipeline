@@ -19,7 +19,9 @@ except ModuleNotFoundError:
 import cv2
 import numpy as np
 import torch
+# Import Pillow before SAM3/torchvision on Windows to avoid PIL DLL loading conflicts.
 from PIL import Image, ImageDraw
+
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 
