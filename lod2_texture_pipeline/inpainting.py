@@ -147,9 +147,15 @@ def lama_fill_rectified_wall(
     ortho_rgba: np.ndarray,
     wall_poly_px: np.ndarray,
     debug_mask_path: Optional[str] = None,
+    valid_content_mask: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Fill missing pixels inside the rectified wall polygon using LaMa.
+
+    When ``valid_content_mask`` is supplied, it is authoritative: pixels
+    inside the wall but outside that mask are holes even if the RGBA source is
+    still opaque there. This is how the bounded SAM result removes occluders
+    before inpainting.
 
     Returns:
         filled_rgba, hole_mask_u8
@@ -162,9 +168,23 @@ def lama_fill_rectified_wall(
     wall_region_mask = build_wall_region_mask(H, W, wall_poly_px)
     alpha = ortho_rgba[:, :, 3]
 
-    # Fill only transparent pixels inside the wall polygon.
+    if valid_content_mask is None:
+        valid_wall_content = (wall_region_mask > 0) & (alpha > 0)
+    else:
+        valid_content_mask = np.asarray(valid_content_mask, dtype=bool)
+        if valid_content_mask.shape != (H, W):
+            raise ValueError(
+                "valid_content_mask must match the HxW rectified image shape"
+            )
+        valid_wall_content = (
+            (wall_region_mask > 0)
+            & (alpha > 0)
+            & valid_content_mask
+        )
+
+    # Fill every wall pixel not certified as valid facade content.
     hole_mask = np.zeros((H, W), dtype=np.uint8)
-    hole_mask[(wall_region_mask > 0) & (alpha == 0)] = 255
+    hole_mask[(wall_region_mask > 0) & ~valid_wall_content] = 255
 
     hole_mask = remove_small_mask_components(hole_mask, LAMA_MIN_HOLE_AREA_PX)
 
@@ -181,13 +201,12 @@ def lama_fill_rectified_wall(
 
     rgb = ortho_rgba[:, :, :3].copy()
 
-    valid_wall_pixels = (wall_region_mask > 0) & (alpha > 0)
-    if np.any(valid_wall_pixels):
-        median_color = np.median(rgb[valid_wall_pixels], axis=0).astype(np.uint8)
+    if np.any(valid_wall_content):
+        median_color = np.median(rgb[valid_wall_content], axis=0).astype(np.uint8)
     else:
         median_color = np.array([180, 180, 180], dtype=np.uint8)
 
-    rgb[(wall_region_mask > 0) & (alpha == 0)] = median_color
+    rgb[hole_mask > 0] = median_color
     rgb[wall_region_mask == 0] = 0
 
     image_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -199,9 +218,6 @@ def lama_fill_rectified_wall(
 
     filled_rgba[fill_idx, :3] = result_rgb[fill_idx]
     filled_rgba[fill_idx, 3] = 255
-
-    # Keep the original alpha everywhere else so the full orthorectified
-    # segmentation remains visible outside the projected wall polygon too.
 
     if debug_mask_path is not None:
         Image.fromarray(hole_mask).save(debug_mask_path)

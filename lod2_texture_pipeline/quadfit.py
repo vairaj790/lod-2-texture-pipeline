@@ -9,6 +9,18 @@ import numpy as np
 from PIL import Image
 
 from .config import *
+
+def _rgba_image_to_bgr_on_background(img_pil: Image.Image, bg=(246, 246, 244)) -> np.ndarray:
+    rgba = np.asarray(img_pil.convert("RGBA"), dtype=np.float32)
+    alpha = rgba[:, :, 3:4] / 255.0
+    bg_rgb = np.empty(rgba.shape[:2] + (3,), dtype=np.float32)
+    bg_rgb[:, :, 0] = float(bg[0])
+    bg_rgb[:, :, 1] = float(bg[1])
+    bg_rgb[:, :, 2] = float(bg[2])
+    rgb = rgba[:, :, :3] * alpha + bg_rgb * (1.0 - alpha)
+    rgb = np.clip(rgb, 0.0, 255.0).astype(np.uint8)
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
 def _binary_mask_stats(mask: np.ndarray):
     ys, xs = np.where(mask > 0)
     if len(xs) == 0:
@@ -163,6 +175,26 @@ def build_edge_map_for_hough(rgb_img: np.ndarray, alpha_mask_bool: np.ndarray) -
         edges = cv2.dilate(edges, kernel, iterations=1)
 
     return edges
+
+def build_alpha_boundary_edge_map_for_hough(alpha_mask_bool: np.ndarray) -> np.ndarray:
+    """
+    Build Hough input from the segmentation silhouette, not interior image
+    texture. This is the correct signal for aligning a segmented facade outline
+    to the projected facade polygon.
+    """
+    alpha = (np.asarray(alpha_mask_bool).astype(np.uint8) * 255)
+    if alpha.ndim != 2 or int((alpha > 0).sum()) == 0:
+        return np.zeros_like(alpha, dtype=np.uint8)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    edge = cv2.morphologyEx(alpha, cv2.MORPH_GRADIENT, kernel)
+
+    if HOUGH_CANNY_DILATE_PX > 0:
+        k = 2 * HOUGH_CANNY_DILATE_PX + 1
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+        edge = cv2.dilate(edge, dilate_kernel, iterations=1)
+
+    return edge
 
 def angle_deg_of_segment(p0: np.ndarray, p1: np.ndarray) -> float:
     dx = float(p1[0] - p0[0])
@@ -369,9 +401,9 @@ def save_hough_all_lines_overlay(
     selected_right: Optional[np.ndarray],
     selected_top: Optional[np.ndarray],
     out_path: str,
+    selected_edges: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
-    out = np.array(img_pil.convert("RGBA")).copy()
-    out_bgr = cv2.cvtColor(out, cv2.COLOR_RGBA2BGR)
+    out_bgr = _rgba_image_to_bgr_on_background(img_pil)
 
     if all_lines is not None:
         for seg in all_lines:
@@ -380,10 +412,11 @@ def save_hough_all_lines_overlay(
             cv2.line(out_bgr, p0, p1, (0, 220, 220), 1)
 
     if wall_quad_xy is not None:
-        q_i = np.round(wall_quad_xy).astype(np.int32)
-        for i in range(4):
+        q_i = np.round(np.asarray(wall_quad_xy, dtype=np.float64)).astype(np.int32)
+        n = len(q_i)
+        for i in range(n):
             p1 = tuple(q_i[i])
-            p2 = tuple(q_i[(i + 1) % 4])
+            p2 = tuple(q_i[(i + 1) % n])
             cv2.line(out_bgr, p1, p2, (0, 0, 255), 2)
 
     def draw_selected(seg: Optional[np.ndarray], color_bgr: Tuple[int, int, int], label: str):
@@ -397,12 +430,31 @@ def save_hough_all_lines_overlay(
         mid = ((p0[0] + p1[0]) // 2, (p0[1] + p1[1]) // 2)
         cv2.putText(out_bgr, label, mid, cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
 
-    draw_selected(selected_left,  (0, 255, 0),   "SEL_LEFT")
-    draw_selected(selected_right, (255, 0, 255), "SEL_RIGHT")
-    draw_selected(selected_top,   (0, 165, 255), "SEL_TOP")
+    if selected_edges:
+        palette = [
+            (0, 255, 0),
+            (255, 0, 255),
+            (0, 165, 255),
+            (255, 180, 0),
+            (40, 220, 255),
+            (180, 80, 255),
+        ]
+        for k, edge in enumerate(selected_edges):
+            seg = edge.get("selected_line")
+            if seg is None:
+                continue
+            draw_selected(
+                np.asarray(seg, dtype=np.float64),
+                palette[k % len(palette)],
+                f"E{int(edge.get('edge_index', k))}"
+            )
+    else:
+        draw_selected(selected_left,  (0, 255, 0),   "SEL_LEFT")
+        draw_selected(selected_right, (255, 0, 255), "SEL_RIGHT")
+        draw_selected(selected_top,   (0, 165, 255), "SEL_TOP")
 
-    out_rgba = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGBA)
-    Image.fromarray(out_rgba).save(out_path)
+    out_rgb = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
+    Image.fromarray(out_rgb).save(out_path)
 
 def x_at_y_on_line(line_xy: np.ndarray, y: float) -> float:
     """
@@ -585,40 +637,81 @@ def warp_line_horizontally(
 
 def apply_hough_guided_ortho_warp(
     ortho_rgba: np.ndarray,
-    sel_left_line: np.ndarray,
-    sel_right_line: np.ndarray,
-    sel_top_line: np.ndarray,
+    sel_left_line: Optional[np.ndarray],
+    sel_right_line: Optional[np.ndarray],
+    sel_top_line: Optional[np.ndarray],
     proj_left_line: np.ndarray,
     proj_right_line: np.ndarray,
-    proj_top_line: np.ndarray
+    proj_top_line: Optional[np.ndarray]
 ) -> np.ndarray:
     """
     Two-stage inverse remap in ortho space:
-      1) horizontal warp to align left/right selected lines to projected lines
+      1) horizontal warp to align detected side lines to projected lines
       2) vertical warp to align top selected line to projected top line
 
-    This uses the selected lines as directional anchors.
+    A missing left or right detection becomes an identity anchor at that
+    projected side. This lets one reliable side correct the texture while the
+    opposite side stays fixed.
     """
     H, W = ortho_rgba.shape[:2]
+    eps = 1e-6
+
+    if sel_left_line is None and sel_right_line is None:
+        return ortho_rgba.copy()
+    if sel_left_line is None:
+        sel_left_line = np.asarray(proj_left_line, dtype=np.float64)
+    if sel_right_line is None:
+        sel_right_line = np.asarray(proj_right_line, dtype=np.float64)
+
+    def _x_at_y_vec(line_xy: np.ndarray, y_vals: np.ndarray) -> np.ndarray:
+        p0 = np.asarray(line_xy[0], dtype=np.float64)
+        p1 = np.asarray(line_xy[1], dtype=np.float64)
+        x0, y0 = float(p0[0]), float(p0[1])
+        x1, y1 = float(p1[0]), float(p1[1])
+        if abs(y1 - y0) < 1e-9:
+            return np.full_like(y_vals, 0.5 * (x0 + x1), dtype=np.float64)
+        t = (y_vals - y0) / (y1 - y0)
+        return x0 + t * (x1 - x0)
+
+    def _y_at_x_vec(line_xy: np.ndarray, x_vals: np.ndarray) -> np.ndarray:
+        p0 = np.asarray(line_xy[0], dtype=np.float64)
+        p1 = np.asarray(line_xy[1], dtype=np.float64)
+        x0, y0 = float(p0[0]), float(p0[1])
+        x1, y1 = float(p1[0]), float(p1[1])
+        if abs(x1 - x0) < 1e-9:
+            return np.full_like(x_vals, 0.5 * (y0 + y1), dtype=np.float64)
+        t = (x_vals - x0) / (x1 - x0)
+        return y0 + t * (y1 - y0)
 
     # ---------- stage 1: horizontal remap ----------
-    map_x_h = np.zeros((H, W), dtype=np.float32)
-    map_y_h = np.zeros((H, W), dtype=np.float32)
+    y_vals = np.arange(H, dtype=np.float64)
+    x_vals = np.arange(W, dtype=np.float64)
+    xd = x_vals[None, :]
 
-    for y in range(H):
-        yf = float(y)
-        for xd in range(W):
-            xsrc = inverse_piecewise_horizontal_map(
-                xd=float(xd),
-                y=yf,
-                src_left_line=sel_left_line,
-                src_right_line=sel_right_line,
-                dst_left_line=proj_left_line,
-                dst_right_line=proj_right_line,
-                width=W
-            )
-            map_x_h[y, xd] = np.float32(np.clip(xsrc, 0.0, float(W - 1)))
-            map_y_h[y, xd] = np.float32(yf)
+    xs_l = _x_at_y_vec(sel_left_line, y_vals)[:, None]
+    xs_r = _x_at_y_vec(sel_right_line, y_vals)[:, None]
+    xd_l = _x_at_y_vec(proj_left_line, y_vals)[:, None]
+    xd_r = _x_at_y_vec(proj_right_line, y_vals)[:, None]
+
+    src_swap = xs_l > xs_r
+    dst_swap = xd_l > xd_r
+    xs_l_o = np.where(src_swap, xs_r, xs_l)
+    xs_r_o = np.where(src_swap, xs_l, xs_r)
+    xd_l_o = np.where(dst_swap, xd_r, xd_l)
+    xd_r_o = np.where(dst_swap, xd_l, xd_r)
+
+    left_src = xd * (xs_l_o / np.maximum(xd_l_o, eps))
+    middle_t = (xd - xd_l_o) / np.maximum(xd_r_o - xd_l_o, eps)
+    middle_src = xs_l_o + middle_t * (xs_r_o - xs_l_o)
+    right_t = (xd - xd_r_o) / np.maximum(float(W - 1) - xd_r_o, eps)
+    right_src = xs_r_o + right_t * (float(W - 1) - xs_r_o)
+    map_x_h = np.where(
+        xd <= xd_l_o,
+        left_src,
+        np.where(xd <= xd_r_o, middle_src, right_src),
+    )
+    map_x_h = np.clip(map_x_h, 0.0, float(W - 1)).astype(np.float32)
+    map_y_h = np.repeat(np.arange(H, dtype=np.float32)[:, None], W, axis=1)
 
     ortho_rgba_h = cv2.remap(
         ortho_rgba,
@@ -628,6 +721,9 @@ def apply_hough_guided_ortho_warp(
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(0, 0, 0, 0)
     )
+
+    if sel_top_line is None or proj_top_line is None:
+        return ortho_rgba_h
 
     # map selected top line into the horizontally-warped frame
     sel_top_after_h = warp_line_horizontally(
@@ -640,21 +736,16 @@ def apply_hough_guided_ortho_warp(
     )
 
     # ---------- stage 2: vertical remap ----------
-    map_x_v = np.zeros((H, W), dtype=np.float32)
-    map_y_v = np.zeros((H, W), dtype=np.float32)
+    yd = y_vals[:, None]
+    ys_t = _y_at_x_vec(sel_top_after_h, x_vals)[None, :]
+    yd_t = _y_at_x_vec(proj_top_line, x_vals)[None, :]
 
-    for yd in range(H):
-        ydf = float(yd)
-        for x in range(W):
-            ysrc = inverse_piecewise_vertical_map(
-                yd=ydf,
-                x=float(x),
-                src_top_line=sel_top_after_h,
-                dst_top_line=proj_top_line,
-                height=H
-            )
-            map_x_v[yd, x] = np.float32(float(x))
-            map_y_v[yd, x] = np.float32(np.clip(ysrc, 0.0, float(H - 1)))
+    above_src = yd * (ys_t / np.maximum(yd_t, eps))
+    below_t = (yd - yd_t) / np.maximum(float(H - 1) - yd_t, eps)
+    below_src = ys_t + below_t * (float(H - 1) - ys_t)
+    map_y_v = np.where(yd <= yd_t, above_src, below_src)
+    map_y_v = np.clip(map_y_v, 0.0, float(H - 1)).astype(np.float32)
+    map_x_v = np.repeat(np.arange(W, dtype=np.float32)[None, :], H, axis=0)
 
     ortho_rgba_hv = cv2.remap(
         ortho_rgba_h,
@@ -667,6 +758,142 @@ def apply_hough_guided_ortho_warp(
 
     return ortho_rgba_hv
 
+def apply_hough_guided_polygon_affine_warp(
+    ortho_rgba: np.ndarray,
+    selected_edges: List[Dict[str, Any]]
+) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, Any]]:
+    """
+    Estimate one affine correction from many matched facade-outline edges.
+
+    Each selected edge supplies an observed source line from Hough and the
+    target projected facade edge. Points sampled on the source line are matched
+    to the corresponding target edge positions, then one global affine warp is
+    applied to the RGBA texture.
+    """
+    info = {
+        "applied": False,
+        "method": "affine_from_selected_polygon_edge_lines",
+        "num_edge_matches": 0,
+        "num_point_pairs": 0,
+        "reason": None,
+        "matrix_2x3": None,
+    }
+
+    if ortho_rgba is None or ortho_rgba.ndim != 3 or ortho_rgba.shape[2] != 4:
+        info["reason"] = "invalid_rgba"
+        return ortho_rgba, None, info
+
+    H, W = ortho_rgba.shape[:2]
+    src_pts = []
+    dst_pts = []
+    used_edges = 0
+
+    for edge in selected_edges or []:
+        selected_line = edge.get("selected_line")
+        target_p0 = edge.get("target_p0")
+        target_p1 = edge.get("target_p1")
+        if selected_line is None or target_p0 is None or target_p1 is None:
+            continue
+
+        src_line = np.asarray(selected_line, dtype=np.float64)
+        target = np.vstack([
+            np.asarray(target_p0, dtype=np.float64),
+            np.asarray(target_p1, dtype=np.float64),
+        ])
+        if src_line.shape != (2, 2) or target.shape != (2, 2):
+            continue
+        if not (np.isfinite(src_line).all() and np.isfinite(target).all()):
+            continue
+
+        target_dir = target[1] - target[0]
+        target_len = float(np.linalg.norm(target_dir))
+        src_dir = src_line[1] - src_line[0]
+        src_len = float(np.linalg.norm(src_dir))
+        if target_len < 1e-6 or src_len < 1e-6:
+            continue
+
+        target_u = target_dir / target_len
+        src_u = src_dir / src_len
+        if float(np.dot(src_u, target_u)) < 0.0:
+            src_u = -src_u
+
+        target_center = 0.5 * (target[0] + target[1])
+        src_center = 0.5 * (src_line[0] + src_line[1])
+        for target_pt in (target[0], target_center, target[1]):
+            along = float(np.dot(target_pt - target_center, target_u))
+            src_pt = src_center + along * src_u
+            src_pts.append(src_pt)
+            dst_pts.append(target_pt)
+        used_edges += 1
+
+    info["num_edge_matches"] = int(used_edges)
+    info["num_point_pairs"] = int(len(src_pts))
+    if used_edges < 2:
+        info["reason"] = "not_enough_edge_matches"
+        return ortho_rgba, None, info
+    if len(src_pts) < 3:
+        info["reason"] = "not_enough_point_pairs"
+        return ortho_rgba, None, info
+
+    src_arr = np.asarray(src_pts, dtype=np.float32)
+    dst_arr = np.asarray(dst_pts, dtype=np.float32)
+    if np.linalg.matrix_rank(dst_arr - dst_arr.mean(axis=0, keepdims=True)) < 2:
+        info["reason"] = "degenerate_target_points"
+        return ortho_rgba, None, info
+    M, inliers = cv2.estimateAffine2D(
+        src_arr,
+        dst_arr,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=8.0,
+        maxIters=2000,
+        confidence=0.98,
+        refineIters=10,
+    )
+    if M is None:
+        M, inliers = cv2.estimateAffinePartial2D(
+            src_arr,
+            dst_arr,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=8.0,
+            maxIters=2000,
+            confidence=0.98,
+            refineIters=10,
+        )
+    if M is None:
+        info["reason"] = "affine_estimation_failed"
+        return ortho_rgba, None, info
+
+    M = np.asarray(M, dtype=np.float64)
+    det = float(np.linalg.det(M[:, :2]))
+    max_trans = float(max(W, H) * 0.75)
+    if not np.isfinite(M).all() or abs(det) < 0.20 or abs(det) > 5.0:
+        info["reason"] = "affine_sanity_failed"
+        info["determinant"] = det
+        return ortho_rgba, None, info
+    if float(np.linalg.norm(M[:, 2])) > max_trans:
+        info["reason"] = "affine_translation_too_large"
+        info["translation_norm_px"] = float(np.linalg.norm(M[:, 2]))
+        return ortho_rgba, None, info
+
+    warped = cv2.warpAffine(
+        ortho_rgba,
+        M.astype(np.float32),
+        (W, H),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
+    )
+
+    info.update({
+        "applied": True,
+        "reason": "applied",
+        "determinant": det,
+        "translation_norm_px": float(np.linalg.norm(M[:, 2])),
+        "matrix_2x3": [[float(v) for v in row] for row in M.tolist()],
+        "inliers": int(np.asarray(inliers).sum()) if inliers is not None else None,
+    })
+    return warped, M, info
+
 def save_hough_warp_overlay(
     img_pil: Image.Image,
     wall_quad_xy: np.ndarray,
@@ -675,18 +902,18 @@ def save_hough_warp_overlay(
     """
     Save transformed result with projected wall quad overlay.
     """
-    out = np.array(img_pil.convert("RGBA")).copy()
-    out_bgr = cv2.cvtColor(out, cv2.COLOR_RGBA2BGR)
+    out_bgr = _rgba_image_to_bgr_on_background(img_pil)
 
-    q_i = np.round(wall_quad_xy).astype(np.int32)
-    for i in range(4):
+    q_i = np.round(np.asarray(wall_quad_xy, dtype=np.float64)).astype(np.int32)
+    n = len(q_i)
+    for i in range(n):
         p1 = tuple(q_i[i])
-        p2 = tuple(q_i[(i + 1) % 4])
+        p2 = tuple(q_i[(i + 1) % n])
         cv2.line(out_bgr, p1, p2, (0, 0, 255), 2)
         mid = ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
         cv2.putText(
             out_bgr,
-            f"W{i+1}",
+            f"W{i}",
             mid,
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -695,8 +922,8 @@ def save_hough_warp_overlay(
             cv2.LINE_AA
         )
 
-    out_rgba = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGBA)
-    Image.fromarray(out_rgba).save(out_path)
+    out_rgb = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
+    Image.fromarray(out_rgb).save(out_path)
 
 def quad_area_abs(poly: np.ndarray) -> float:
     poly = np.asarray(poly, dtype=np.float64)

@@ -1,26 +1,60 @@
+# Python bytecode, build output, and tool caches
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.pyd
 *.so
 *.egg-info/
-.venv/
-.env
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
 .ipynb_checkpoints/
+
+# Local environments, editors, and operating-system files
+.venv/
+venv/
+.env
+.env.*
+!.env.example
 .vscode/
 .idea/
+.DS_Store
+desktop.ini
+
+# Secrets and machine-local configuration
+lod2_texture_pipeline/config_local.py
+
+# Generated pipeline data and runtime caches
 output/
 outputs/
 inputs/
-sam3/
-lod2_texture_pipeline/config_local.py
-sam3_mesh_search_retrieve_stitch_segment_rectify_bake.py
+cache/
 rectification/
+experiments/
+
+# Local bulk/duplicate datasets; keep only curated fixtures in the two
+# sample_data subdirectories under version control.
+sample_data/3d_geojsons_all/
+sample_data/geotiffs_all/
+sample_data/*.geojson
+sample_data/*.tif
+sample_data/3d_geojsons/*
+!sample_data/3d_geojsons/building_202065642_3d.geojson
+!sample_data/3d_geojsons/building_48959353_3d.geojson
+sample_data/geotiffs/*
+!sample_data/geotiffs/building_202065642.tif
+!sample_data/geotiffs/building_48959353.tif
+
+# External checkouts and model/output binaries
+sam3/
 *.glb
-*.png
-*.jpg
-*.jpeg
+*.kmz
 *.npz
 *.onnx
-.DS_Store
-.codex
+*.pt
+*.pth
+*.ckpt
+*.safetensors
