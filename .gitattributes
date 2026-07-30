@@ -1,0 +1,21 @@
+* text=auto
+
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.geojson text eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.tif binary
+*.tiff binary
+*.glb binary
+*.kmz binary
+*.npz binary
+*.onnx binary
+*.pt binary
+*.pth binary
+*.safetensors binary

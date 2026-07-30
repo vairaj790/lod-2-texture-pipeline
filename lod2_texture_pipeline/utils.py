@@ -171,7 +171,7 @@ def save_sam3_instance_debug_overlay(
     base_img_pil: Image.Image,
     facade_stack: np.ndarray,
     roof_mask: np.ndarray,
-    selected_idx: int,
+    selected_idx,
     facade_scores,
     out_path: str
 ):
@@ -190,6 +190,13 @@ def save_sam3_instance_debug_overlay(
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay, "RGBA")
     font = ImageFont.load_default()
+
+    if selected_idx is None:
+        selected_indices = set()
+    elif isinstance(selected_idx, (list, tuple, set, np.ndarray)):
+        selected_indices = {int(i) for i in selected_idx if int(i) >= 0}
+    else:
+        selected_indices = {int(selected_idx)} if int(selected_idx) >= 0 else set()
 
     # optional roof overlay (very light cyan, just for context)
     if roof_mask is not None and roof_mask.any():
@@ -220,7 +227,7 @@ def save_sam3_instance_debug_overlay(
         if not mask.any():
             continue
 
-        is_keep = (i == selected_idx)
+        is_keep = (i in selected_indices)
 
         if is_keep:
             fill_rgba = (0, 255, 0, 120)

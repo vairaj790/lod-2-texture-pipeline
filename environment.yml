@@ -6,11 +6,7 @@ channels:
 dependencies:
   - python=3.12
   - numpy>=1.26,<2
-  - libjpeg-turbo
-  - libpng
-  - zlib
-  - pandas
-  - geopandas
+  - geopandas-base
   - shapely
   - pyproj
   - rasterio<1.5
@@ -20,7 +16,6 @@ dependencies:
   - trimesh
   - scipy
   - matplotlib
-  - fiona
   - pyogrio
   - setuptools<81
   - pip
