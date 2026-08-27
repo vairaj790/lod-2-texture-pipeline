@@ -10,6 +10,262 @@ from PIL import Image, ImageDraw
 from scipy.spatial import Delaunay
 from shapely.geometry import LineString, MultiLineString, Polygon
 from shapely.ops import polygonize_full, triangulate
+
+
+def repair_mesh_t_junctions(
+    meshes_named,
+    tolerance=1e-6,
+    area_tolerance=1e-12,
+):
+    """Return export-safe meshes with conforming shared boundary edges.
+
+    LOD2 inputs can represent a roof-height discontinuity with a short wall
+    edge ``B-L``, a roof-seam edge ``L-H``, and the neighbouring wall's single
+    tall edge ``B-H``.  The surfaces occupy the right locations, but the latter
+    is a T-junction and triangle-soup watertightness checks see three open
+    edges.  Split such boundary edges at already-existing vertices from the
+    other meshes.  No surface is moved; texture coordinates and vertex colors
+    are linearly interpolated along the split edge.
+
+    Zero-area faces are removed first.  A mesh containing only degenerate
+    faces is omitted from the returned list.
+    """
+    tol = max(float(tolerance), 1e-12)
+    area_tol = max(float(area_tolerance), 0.0)
+    cleaned = []
+    stats = {
+        "input_meshes": int(len(meshes_named)),
+        "output_meshes": 0,
+        "degenerate_faces_removed": 0,
+        "degenerate_meshes_removed": 0,
+        "boundary_edges_split": 0,
+        "vertices_added": 0,
+        "faces_added": 0,
+    }
+
+    for name, mesh in meshes_named:
+        vertices = np.asarray(getattr(mesh, "vertices", []), dtype=np.float64)
+        faces = np.asarray(getattr(mesh, "faces", []), dtype=np.int64)
+        if (
+            vertices.ndim != 2
+            or vertices.shape[1] != 3
+            or faces.ndim != 2
+            or faces.shape[1] != 3
+            or len(faces) == 0
+        ):
+            stats["degenerate_meshes_removed"] += 1
+            continue
+
+        triangles = vertices[faces]
+        twice_area = np.linalg.norm(
+            np.cross(triangles[:, 1] - triangles[:, 0],
+                     triangles[:, 2] - triangles[:, 0]),
+            axis=1,
+        )
+        keep = np.isfinite(twice_area) & (twice_area > area_tol)
+        removed = int((~keep).sum())
+        stats["degenerate_faces_removed"] += removed
+        if not keep.any():
+            stats["degenerate_meshes_removed"] += 1
+            continue
+
+        cleaned.append({
+            "name": name,
+            "mesh": mesh,
+            "vertices": vertices.copy(),
+            "faces": faces[keep].copy(),
+            "source_face_indices": np.flatnonzero(keep).astype(np.int64),
+            "removed_faces": removed,
+        })
+
+    if not cleaned:
+        return [], stats
+
+    candidate_positions = []
+    candidate_mesh_indices = []
+    for mesh_index, item in enumerate(cleaned):
+        candidate_positions.append(item["vertices"])
+        candidate_mesh_indices.extend([mesh_index] * len(item["vertices"]))
+    candidate_positions = np.vstack(candidate_positions)
+    candidate_mesh_indices = np.asarray(candidate_mesh_indices, dtype=np.int64)
+
+    repaired = []
+    for mesh_index, item in enumerate(cleaned):
+        old_mesh = item["mesh"]
+        vertices = item["vertices"]
+        faces = item["faces"]
+
+        all_edges = np.sort(
+            faces[:, [[0, 1], [1, 2], [2, 0]]].reshape(-1, 2),
+            axis=1,
+        )
+        unique_edges, edge_counts = np.unique(
+            all_edges,
+            axis=0,
+            return_counts=True,
+        )
+        boundary_edges = unique_edges[edge_counts == 1]
+
+        split_positions = {}
+        other_candidates = candidate_positions[
+            candidate_mesh_indices != mesh_index
+        ]
+        for edge in boundary_edges:
+            a_idx, b_idx = int(edge[0]), int(edge[1])
+            a = vertices[a_idx]
+            b = vertices[b_idx]
+            direction = b - a
+            length_sq = float(np.dot(direction, direction))
+            if length_sq <= tol * tol:
+                continue
+
+            # Elementwise dot products avoid launching a BLAS kernel for the
+            # many tiny (N x 3) boundary-candidate checks.
+            delta = other_candidates - a
+            t = np.sum(delta * direction, axis=1) / length_sq
+            interior = (t > tol / np.sqrt(length_sq)) & (
+                t < 1.0 - tol / np.sqrt(length_sq)
+            )
+            if not interior.any():
+                continue
+            projected = a + t[:, None] * direction
+            distance = np.linalg.norm(projected - other_candidates, axis=1)
+            matches = np.flatnonzero(interior & (distance <= tol))
+            if len(matches) == 0:
+                continue
+
+            ordered = sorted(
+                [
+                    (float(t[index]), other_candidates[index].copy())
+                    for index in matches
+                ],
+                key=lambda pair: pair[0],
+            )
+            deduped = []
+            for fraction, position in ordered:
+                if deduped and np.linalg.norm(position - deduped[-1][1]) <= tol:
+                    continue
+                deduped.append((fraction, position))
+            if deduped:
+                split_positions[(a_idx, b_idx)] = deduped
+
+        if not split_positions and item["removed_faces"] == 0:
+            # The caller only needs copies for meshes whose connectivity
+            # changes. Reusing untouched meshes also avoids duplicating large
+            # baked texture images in memory before export.
+            repaired.append((item["name"], old_mesh))
+            continue
+
+        new_vertices = vertices.tolist()
+        visual = getattr(old_mesh, "visual", None)
+        old_uv = getattr(visual, "uv", None)
+        if old_uv is not None:
+            old_uv = np.asarray(old_uv, dtype=np.float64)
+            if old_uv.shape != (len(vertices), 2):
+                old_uv = None
+        new_uv = old_uv.tolist() if old_uv is not None else None
+
+        visual_kind = getattr(visual, "kind", None)
+        old_vertex_colors = None
+        new_vertex_colors = None
+        if visual_kind == "vertex":
+            old_vertex_colors = np.asarray(visual.vertex_colors)
+            if len(old_vertex_colors) == len(vertices):
+                new_vertex_colors = old_vertex_colors.astype(np.float64).tolist()
+            else:
+                old_vertex_colors = None
+
+        edge_middle_indices = {}
+        for edge, points in sorted(split_positions.items()):
+            a_idx, b_idx = edge
+            middle = []
+            for fraction, position in points:
+                new_index = len(new_vertices)
+                new_vertices.append(position.tolist())
+                if new_uv is not None:
+                    interpolated_uv = (
+                        (1.0 - fraction) * old_uv[a_idx]
+                        + fraction * old_uv[b_idx]
+                    )
+                    new_uv.append(interpolated_uv.tolist())
+                if new_vertex_colors is not None:
+                    color = (
+                        (1.0 - fraction) * old_vertex_colors[a_idx]
+                        + fraction * old_vertex_colors[b_idx]
+                    )
+                    new_vertex_colors.append(color.tolist())
+                middle.append(new_index)
+            edge_middle_indices[edge] = middle
+            stats["boundary_edges_split"] += 1
+            stats["vertices_added"] += len(middle)
+
+        face_records = [
+            ([int(v) for v in face], int(source_face_index))
+            for face, source_face_index in zip(
+                faces,
+                item["source_face_indices"],
+            )
+        ]
+        for edge, middle in sorted(edge_middle_indices.items()):
+            a_idx, b_idx = edge
+            updated = []
+            for face, source_face_index in face_records:
+                split = False
+                for offset in range(3):
+                    first = face[offset]
+                    second = face[(offset + 1) % 3]
+                    opposite = face[(offset + 2) % 3]
+                    if first == a_idx and second == b_idx:
+                        chain = [a_idx, *middle, b_idx]
+                    elif first == b_idx and second == a_idx:
+                        chain = [b_idx, *reversed(middle), a_idx]
+                    else:
+                        continue
+                    updated.extend(
+                        ([chain[i], chain[i + 1], opposite], source_face_index)
+                        for i in range(len(chain) - 1)
+                    )
+                    split = True
+                    break
+                if not split:
+                    updated.append((face, source_face_index))
+            face_records = updated
+
+        new_faces = np.asarray([record[0] for record in face_records], dtype=np.int64)
+        source_face_indices = np.asarray(
+            [record[1] for record in face_records],
+            dtype=np.int64,
+        )
+        stats["faces_added"] += int(len(new_faces) - len(faces))
+
+        out = trimesh.Trimesh(
+            vertices=np.asarray(new_vertices, dtype=np.float64),
+            faces=new_faces,
+            process=False,
+        )
+        if new_uv is not None:
+            out.visual = trimesh.visual.texture.TextureVisuals(
+                uv=np.asarray(new_uv, dtype=np.float64),
+                material=getattr(visual, "material", None),
+            )
+        elif new_vertex_colors is not None:
+            out.visual.vertex_colors = np.clip(
+                np.rint(np.asarray(new_vertex_colors)),
+                0,
+                255,
+            ).astype(np.uint8)
+        elif visual_kind == "face":
+            old_face_colors = np.asarray(visual.face_colors)
+            if len(old_face_colors) == len(old_mesh.faces):
+                out.visual.face_colors = old_face_colors[source_face_indices]
+
+        out.metadata.update(dict(getattr(old_mesh, "metadata", {}) or {}))
+        repaired.append((item["name"], out))
+
+    stats["output_meshes"] = int(len(repaired))
+    return repaired, stats
+
+
 def _build_wall_mesh_from_verts(verts4_xyz: np.ndarray,
                                 outward_normal_xyz: np.ndarray,
                                 uv_px: Optional[np.ndarray] = None,

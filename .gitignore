@@ -7,11 +7,17 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+.tmp_uv_cache/
+.agents/
+/tests/
 .coverage
 htmlcov/
 .mypy_cache/
 .ruff_cache/
 .ipynb_checkpoints/
+*.log
+*.bak
+*.orig
 
 # Local environments, editors, and operating-system files
 .venv/
@@ -25,7 +31,16 @@ venv/
 desktop.ini
 
 # Secrets and machine-local configuration
-lod2_texture_pipeline/config_local.py
+lod2_texture_pipeline/config_local*.py
+lod2_texture_pipeline/config_local.py.*
+!lod2_texture_pipeline/config_local.example.py
+client_secret*.json
+credentials*.json
+service-account*.json
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Generated pipeline data and runtime caches
 output/
@@ -34,11 +49,21 @@ inputs/
 cache/
 rectification/
 experiments/
+/to upload on Cesium as base/
+
+# Large local workspace assets. The documented installation keeps these as
+# siblings of this repository, but ignore them if they are placed inside it.
+/raw_data/
+/kmz/
+/lama_model/
 
 # Local bulk/duplicate datasets; keep only curated fixtures in the two
 # sample_data subdirectories under version control.
 sample_data/3d_geojsons_all/
 sample_data/geotiffs_all/
+sample_data/3d_geojsons_full/
+sample_data/geotiffs_full/
+sample_data/old_samples/
 sample_data/*.geojson
 sample_data/*.tif
 sample_data/3d_geojsons/*
@@ -49,10 +74,12 @@ sample_data/geotiffs/*
 !sample_data/geotiffs/building_48959353.tif
 
 # External checkouts and model/output binaries
-sam3/
+/sam3/
 *.glb
 *.kmz
+*.npy
 *.npz
+*.zip
 *.onnx
 *.pt
 *.pth

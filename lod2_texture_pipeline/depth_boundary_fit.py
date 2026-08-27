@@ -8,11 +8,25 @@ The same global image-space transform is then applied to the raw facade
 projection.
 """
 
+from dataclasses import replace
 from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
+from .diagnostic_overlay_style import (
+    ACCEPTED_MODEL_LINE,
+    RAW_MODEL_LINE,
+    REJECTED_MODEL_LINE,
+    SAM_BASE_GUIDE_LINE,
+    SAM_ROOF_GUIDE_LINE,
+    SAM_WALL_GUIDE_LINE,
+    WALL_ONLY_MODEL_LINE,
+    OverlayLineStyle,
+    draw_legend,
+    draw_styled_line,
+    model_projection_legend,
+)
 from .wireframe_fit import (
     WireframeFitConfig,
     apply_homography,
@@ -520,6 +534,7 @@ def fit_depth_silhouette_to_image(
     semantic_boundary_geometry: Optional[Dict[str, object]] = None,
     semantic_class_weights: Optional[Mapping[str, float]] = None,
     valid_image_evidence_mask: Optional[np.ndarray] = None,
+    semantic_valid_image_evidence_mask: Optional[np.ndarray] = None,
     semantic_image_boundary_maps: Optional[Mapping[str, np.ndarray]] = None,
     semantic_image_guidance_metadata: Optional[Mapping[str, object]] = None,
 ) -> Dict[str, object]:
@@ -590,6 +605,7 @@ def fit_depth_silhouette_to_image(
         segment_indices=fit_segments,
         segment_weights=fit_segment_weights,
         valid_evidence_mask=valid_image_evidence_mask,
+        semantic_valid_evidence_mask=semantic_valid_image_evidence_mask,
         segment_classes=fit_segment_classes,
         semantic_boundary_maps=semantic_image_boundary_maps,
     )
@@ -794,6 +810,9 @@ def depth_boundary_fit_metadata(result: Optional[Dict[str, object]]):
             result.get("depth_global_fitted_wall_outline_px", []), dtype=np.float64
         ).astype(float).tolist(),
     })
+    recovery = result.get("background_aware_recovery")
+    if isinstance(recovery, Mapping):
+        metadata["background_aware_recovery"] = dict(recovery)
     return metadata
 
 
@@ -802,12 +821,7 @@ def _draw_segments(
     points: np.ndarray,
     segment_indices: Sequence[Tuple[int, int]],
     config: WireframeFitConfig,
-    color,
-    thickness: int,
-    *,
-    dashed: bool = False,
-    dash_length_px: float = 7.0,
-    dash_gap_px: float = 5.0,
+    style: OverlayLineStyle,
 ):
     segments = visible_segments_from_points(
         np.asarray(points, dtype=np.float64),
@@ -816,37 +830,33 @@ def _draw_segments(
         config,
     )
     for segment in segments:
-        if not dashed:
-            cv2.line(
-                image,
-                tuple(np.round(segment.start).astype(int)),
-                tuple(np.round(segment.end).astype(int)),
-                color,
-                thickness,
-                cv2.LINE_AA,
-            )
-            continue
+        draw_styled_line(
+            image,
+            segment.start,
+            segment.end,
+            style,
+            color_space="bgr",
+        )
 
-        vector = np.asarray(segment.end - segment.start, dtype=np.float64)
-        length = float(np.linalg.norm(vector))
-        if length < 1.0e-6:
-            continue
-        direction = vector / length
-        period = max(float(dash_length_px) + float(dash_gap_px), 1.0)
-        start_distance = 0.0
-        while start_distance < length:
-            end_distance = min(start_distance + max(float(dash_length_px), 1.0), length)
-            p0 = segment.start + direction * start_distance
-            p1 = segment.start + direction * end_distance
-            cv2.line(
-                image,
-                tuple(np.round(p0).astype(int)),
-                tuple(np.round(p1).astype(int)),
-                color,
-                thickness,
-                cv2.LINE_AA,
-            )
-            start_distance += period
+
+def _style_with_legacy_overrides(
+    style: OverlayLineStyle,
+    *,
+    line_thickness_px: Optional[int],
+    dash_length_px: float,
+    dash_gap_px: float,
+) -> OverlayLineStyle:
+    """Keep the public overlay sizing knobs while sharing visual semantics."""
+    return replace(
+        style,
+        width_px=(
+            style.width_px
+            if line_thickness_px is None
+            else max(1, int(line_thickness_px))
+        ),
+        dash_length_px=max(float(dash_length_px), 1.0),
+        dash_gap_px=max(float(dash_gap_px), 0.0),
+    )
 
 
 def create_depth_boundary_fit_overlay(
@@ -854,9 +864,9 @@ def create_depth_boundary_fit_overlay(
     result: Dict[str, object],
     fit_config: WireframeFitConfig,
     *,
-    line_thickness_px: int = 1,
-    dash_length_px: float = 7.0,
-    dash_gap_px: float = 5.0,
+    line_thickness_px: Optional[int] = None,
+    dash_length_px: float = ACCEPTED_MODEL_LINE.dash_length_px,
+    dash_gap_px: float = ACCEPTED_MODEL_LINE.dash_gap_px,
 ) -> np.ndarray:
     image = np.asarray(image_bgr, dtype=np.uint8).copy()
     if result.get("depth_frame_wrappers_filtered", False):
@@ -870,14 +880,11 @@ def create_depth_boundary_fit_overlay(
                 epsilon_px=float(fit_config.image_border_epsilon_px),
             )
         )
-    thickness = max(1, int(line_thickness_px))
-    _draw_segments(
-        image,
-        result["original_points"],
-        segments,
-        fit_config,
-        (255, 220, 0),
-        thickness,
+    raw_style = _style_with_legacy_overrides(
+        RAW_MODEL_LINE,
+        line_thickness_px=line_thickness_px,
+        dash_length_px=dash_length_px,
+        dash_gap_px=dash_gap_px,
     )
     semantic_points = np.asarray(
         result.get("fit_original_points", []),
@@ -885,10 +892,10 @@ def create_depth_boundary_fit_overlay(
     ).reshape(-1, 2)
     semantic_segments = list(result.get("fit_segment_indices", []))
     semantic_classes = list(result.get("semantic_segment_classes", []))
-    semantic_colors = {
-        "roof": (0, 215, 255),
-        "wall": (70, 220, 70),
-        "base": (175, 175, 175),
+    semantic_styles = {
+        "roof": SAM_ROOF_GUIDE_LINE,
+        "wall": SAM_WALL_GUIDE_LINE,
+        "base": SAM_BASE_GUIDE_LINE,
     }
     if (
         result.get("fit_geometry_source") == "visible_semantic_projected_edges"
@@ -906,21 +913,28 @@ def create_depth_boundary_fit_overlay(
                     semantic_points,
                     class_segments,
                     fit_config,
-                    semantic_colors[edge_class],
-                    thickness,
+                    semantic_styles[edge_class],
                 )
+    _draw_segments(
+        image,
+        result["original_points"],
+        segments,
+        fit_config,
+        raw_style,
+    )
     shown = result["fitted_points"] if result.get("applied") else result["candidate_points"]
-    shown_color = (220, 0, 220) if result.get("applied") else (0, 165, 255)
+    shown_style = _style_with_legacy_overrides(
+        ACCEPTED_MODEL_LINE if result.get("applied") else REJECTED_MODEL_LINE,
+        line_thickness_px=line_thickness_px,
+        dash_length_px=dash_length_px,
+        dash_gap_px=dash_gap_px,
+    )
     _draw_segments(
         image,
         shown,
         segments,
         fit_config,
-        shown_color,
-        thickness,
-        dashed=True,
-        dash_length_px=dash_length_px,
-        dash_gap_px=dash_gap_px,
+        shown_style,
     )
     status = "accepted" if result.get("applied") else f"candidate only: {result.get('reason')}"
     transform = result.get("transform", {})
@@ -954,10 +968,9 @@ def create_depth_boundary_fit_overlay(
                 "projection-local evidence guard active; "
                 "SAM3 semantic masks unavailable or not associated"
             )
-    outline_label = (
-        "cyan: raw whole-model silhouette | dashed magenta: fitted whole-model silhouette"
-        if result.get("applied")
-        else "cyan: raw whole-model silhouette | dashed orange: rejected candidate only"
+    outline_label = model_projection_legend(
+        fitted=bool(result.get("applied")),
+        rejected=not bool(result.get("applied")),
     )
     rows = [
         outline_label,
@@ -975,10 +988,7 @@ def create_depth_boundary_fit_overlay(
             f"gain={float(result.get('score_improvement', 0.0)):.4f}"
         ),
     ]
-    for index, row in enumerate(rows):
-        origin = (10, 24 + index * 20)
-        cv2.putText(image, row, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.43, (255, 255, 255), 3, cv2.LINE_AA)
-        cv2.putText(image, row, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.43, (20, 20, 20), 1, cv2.LINE_AA)
+    draw_legend(image, rows, color_space="bgr")
     return image
 
 
@@ -986,9 +996,9 @@ def create_depth_silhouette_shift_overlay(
     result: Dict[str, object],
     fit_config: WireframeFitConfig,
     *,
-    line_thickness_px: int = 2,
-    dash_length_px: float = 7.0,
-    dash_gap_px: float = 5.0,
+    line_thickness_px: Optional[int] = None,
+    dash_length_px: float = ACCEPTED_MODEL_LINE.dash_length_px,
+    dash_gap_px: float = ACCEPTED_MODEL_LINE.dash_gap_px,
 ) -> np.ndarray:
     """Show the raw silhouette mask with its fitted boundary displacement."""
     raw_mask = np.asarray(result["raw_depth_mask"], dtype=bool)
@@ -1001,7 +1011,6 @@ def create_depth_silhouette_shift_overlay(
         axis=2,
     )
     shown = result["fitted_points"] if result.get("applied") else result["candidate_points"]
-    color = (0, 0, 255) if result.get("applied") else (0, 165, 255)
     if result.get("depth_frame_wrappers_filtered", False):
         segments = list(result["segment_indices"])
     else:
@@ -1013,16 +1022,42 @@ def create_depth_silhouette_shift_overlay(
                 epsilon_px=float(fit_config.image_border_epsilon_px),
             )
         )
+    raw_style = _style_with_legacy_overrides(
+        RAW_MODEL_LINE,
+        line_thickness_px=line_thickness_px,
+        dash_length_px=dash_length_px,
+        dash_gap_px=dash_gap_px,
+    )
+    shown_style = _style_with_legacy_overrides(
+        ACCEPTED_MODEL_LINE if result.get("applied") else REJECTED_MODEL_LINE,
+        line_thickness_px=line_thickness_px,
+        dash_length_px=dash_length_px,
+        dash_gap_px=dash_gap_px,
+    )
+    _draw_segments(
+        image,
+        result["original_points"],
+        segments,
+        fit_config,
+        raw_style,
+    )
     _draw_segments(
         image,
         shown,
         segments,
         fit_config,
-        color,
-        max(1, int(line_thickness_px)),
-        dashed=True,
-        dash_length_px=dash_length_px,
-        dash_gap_px=dash_gap_px,
+        shown_style,
+    )
+    draw_legend(
+        image,
+        [
+            model_projection_legend(
+                fitted=bool(result.get("applied")),
+                rejected=not bool(result.get("applied")),
+            ),
+            "white fill=raw whole-model depth silhouette",
+        ],
+        color_space="bgr",
     )
     return image
 
@@ -1032,9 +1067,9 @@ def create_wall_fit_comparison_overlay(
     result: Dict[str, object],
     *,
     selected_mode: str = "wall_only",
-    line_thickness_px: int = 1,
-    dash_length_px: float = 7.0,
-    dash_gap_px: float = 5.0,
+    line_thickness_px: Optional[int] = None,
+    dash_length_px: float = ACCEPTED_MODEL_LINE.dash_length_px,
+    dash_gap_px: float = ACCEPTED_MODEL_LINE.dash_gap_px,
 ) -> np.ndarray:
     image = np.asarray(image_bgr, dtype=np.uint8).copy()
     wall_local = np.round(result["wall_local_fit_outline_px"]).astype(np.int32)
@@ -1045,9 +1080,33 @@ def create_wall_fit_comparison_overlay(
         dtype=np.float64,
     )
     depth_wall = np.round(depth_wall).astype(np.int32)
-    thickness = max(1, int(line_thickness_px))
-    cv2.polylines(image, [wall_local], True, (255, 0, 0), thickness, cv2.LINE_AA)
-    depth_color = (255, 0, 255) if result.get("applied") else (0, 165, 255)
+    wall_style = _style_with_legacy_overrides(
+        WALL_ONLY_MODEL_LINE,
+        line_thickness_px=line_thickness_px,
+        dash_length_px=dash_length_px,
+        dash_gap_px=dash_gap_px,
+    )
+    wall_segments = [
+        (index, (index + 1) % len(wall_local))
+        for index in range(len(wall_local))
+    ]
+    comparison_fit_config = WireframeFitConfig(
+        minimum_visible_segment_length_px=0.0,
+        ignore_segments_on_image_border=False,
+    )
+    _draw_segments(
+        image,
+        wall_local,
+        wall_segments,
+        comparison_fit_config,
+        wall_style,
+    )
+    depth_style = _style_with_legacy_overrides(
+        ACCEPTED_MODEL_LINE if result.get("applied") else REJECTED_MODEL_LINE,
+        line_thickness_px=line_thickness_px,
+        dash_length_px=dash_length_px,
+        dash_gap_px=dash_gap_px,
+    )
     depth_segments = [
         (index, (index + 1) % len(depth_wall))
         for index in range(len(depth_wall))
@@ -1056,15 +1115,8 @@ def create_wall_fit_comparison_overlay(
         image,
         depth_wall,
         depth_segments,
-        WireframeFitConfig(
-            minimum_visible_segment_length_px=0.0,
-            ignore_segments_on_image_border=False,
-        ),
-        depth_color,
-        thickness,
-        dashed=True,
-        dash_length_px=dash_length_px,
-        dash_gap_px=dash_gap_px,
+        comparison_fit_config,
+        depth_style,
     )
     selected_mode = str(selected_mode).strip().lower()
     status = "accepted global fit" if result.get("applied") else "global candidate not accepted"
@@ -1074,11 +1126,14 @@ def create_wall_fit_comparison_overlay(
         else "wall-only"
     )
     rows = [
-        "blue: wall-only fit | dashed magenta/orange: depth-global fit",
+        (
+            "model: solid blue=wall-only fit | dashed magenta=accepted "
+            "depth-global fit"
+            if result.get("applied")
+            else "model: solid blue=wall-only fit | dashed orange=rejected "
+            "depth-global candidate"
+        ),
         f"{status} | downstream alignment: {downstream_label}",
     ]
-    for index, row in enumerate(rows):
-        origin = (10, 24 + index * 20)
-        cv2.putText(image, row, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.43, (255, 255, 255), 3, cv2.LINE_AA)
-        cv2.putText(image, row, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.43, (20, 20, 20), 1, cv2.LINE_AA)
+    draw_legend(image, rows, color_space="bgr")
     return image

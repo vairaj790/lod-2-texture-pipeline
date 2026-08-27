@@ -97,6 +97,13 @@ SOURCE_CRS = "EPSG:25832"
 GLB_EXPORT_LOCAL_COORDINATES = True
 EXPORT_KMZ = True
 KML_ALTITUDE_MODE = "relativeToGround"
+# Final-export geometry repair. Texture generation continues to use the
+# original LiDAR wall geometry; only the finished export receives solid-colour
+# wall skirts down to the building-wide minimum base elevation and a flat base.
+ENABLE_POSTTEXTURE_BASE_LEVEL_REPAIR = True
+POSTTEXTURE_BASE_LEVEL_TOLERANCE_M = 0.001
+POSTTEXTURE_EXTENSION_DOMINANT_COLOR_BITS = 5
+POSTTEXTURE_EXTENSION_MAX_COLOR_SAMPLES = 500_000
 SAVE_FACADE_GROUP_DEBUG_PNG = True
 FACADE_GROUP_ALLOW_PER_WALL_FALLBACK = False
 FACADE_GROUP_MAX_LINE_DEVIATION_M = 1.25
@@ -142,9 +149,10 @@ FACADE_SOURCE_VISIBILITY_MASK_ERODE_PX = 1
 FACADE_SOURCE_VISIBILITY_COMPLETE_THRESHOLD = 0.999
 
 # Use nearby OpenStreetMap building footprints to measure how much of each
-# corrected target wall is hidden by another building. Every valid candidate is
-# globally fitted first, then ranked by its net visible wall fraction after
-# frame loss, self-occlusion, and OSM obstruction. If the selected source is
+# corrected target wall is hidden by another building. Raw-canvas OSM blockers
+# are excluded before SAM association and fitting; nearly fully blocked views
+# are rejected before SAM3. Remaining candidates are ranked by net visible wall
+# fraction after frame loss, self-occlusion, and OSM obstruction. If selected is
 # obstructed, the obstruction-facing divider is extended from image top to
 # bottom as an LR-style side crop and the depth-global fit is run again. That
 # excluded side is then passed downstream as missing alpha for LaMa to fill.
@@ -152,9 +160,23 @@ ENABLE_OSM_EXTERNAL_BUILDING_OCCLUSION = True
 OSM_BUILDING_QUERY_RADIUS_M = 120.0
 OSM_BUILDING_DEFAULT_HEIGHT_M = 15.0
 OSM_BUILDING_LEVEL_HEIGHT_M = 3.0
+# Neighbouring footprints must be extruded from their own terrain elevation.
+# A shared target-building base is invalid on steep streets and can bury an
+# otherwise tall foreground blocker below the camera rays.
+OSM_BUILDING_USE_DGM_TERRAIN = True
+OSM_BUILDING_TERRAIN_MAX_SAMPLES = 9
+OSM_BUILDING_TERRAIN_TOP_MARGIN_M = 0.5
 OSM_BUILDING_DEPTH_TOLERANCE_M = 0.10
 OSM_BUILDING_CORRIDOR_BUFFER_M = 1.0
+# Rendering/depth overlap is the authoritative image-space test.  Requiring a
+# narrow ground-plan corridor first can discard real blockers when Street View
+# positions, roof overhangs, or footprints differ by a few metres.
+OSM_BUILDING_REQUIRE_CORRIDOR_INTERSECTION = False
 OSM_BUILDING_CLEAR_OCCLUSION_FRACTION = 0.005
+# A raw or fitted target with at least this much OSM blockage cannot be a source.
+# The high threshold preserves partially visible views whose small anchored fit
+# can improve alignment, while eliminating the observed 98-100% blocked cases.
+OSM_BUILDING_PREFIT_HARD_REJECT_FRACTION = 0.97
 OSM_BUILDING_OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter"
 OSM_BUILDING_OVERPASS_TIMEOUT_S = 90.0
 OSM_BUILDING_CACHE_DIR = "cache/osm_building_occlusion"
@@ -205,6 +227,30 @@ MODEL_DEPTH_BOUNDARY_FIT_MIN_AREA_PX = 350
 MODEL_DEPTH_BOUNDARY_FIT_MIN_COMPONENT_FRACTION = 0.02
 MODEL_DEPTH_BOUNDARY_FIT_CONTOUR_EPSILON_PX = 1.5
 MODEL_DEPTH_BOUNDARY_FIT_MAX_POINTS = 240
+# Keep the global model around its original projection. Strong target semantics
+# allow the checked +/-50 px corrections; missing/weak semantics only permit a
+# micro correction. All pixel limits are specified for a 640 px canvas and are
+# scaled with image size inside the fitter.
+MODEL_DEPTH_BOUNDARY_ANCHOR_MAX_SCALE_DELTA = 0.10
+# A wider scale range is available only to the guarded background-aware
+# challenger. The incumbent keeps the stable 0.90-1.10 envelope, and the wider
+# result is selected only after a material improvement against the same full
+# roof/sky guide.
+MODEL_DEPTH_BACKGROUND_AWARE_MAX_SCALE_DELTA = 0.25
+MODEL_DEPTH_BACKGROUND_AWARE_MAX_LEGACY_ROOF_RETENTION = 0.50
+MODEL_DEPTH_BACKGROUND_AWARE_MIN_RESTORED_ROOF_PIXELS = 64
+MODEL_DEPTH_BACKGROUND_AWARE_MIN_FULL_ROOF_SCORE_GAIN = 0.08
+MODEL_DEPTH_BACKGROUND_AWARE_MAX_COMMON_SEMANTIC_SCORE_DROP = 0.02
+MODEL_DEPTH_BOUNDARY_ANCHOR_MAX_TRANSLATION_PX = 50.0
+MODEL_DEPTH_BOUNDARY_ANCHOR_MAX_MEAN_DISPLACEMENT_PX = 55.0
+MODEL_DEPTH_BOUNDARY_ANCHOR_MAX_TRANSLATION_FRACTION = 0.25
+MODEL_DEPTH_BOUNDARY_ANCHOR_MAX_DISPLACEMENT_FRACTION = 0.25
+MODEL_DEPTH_BOUNDARY_ANCHOR_MIN_IOU = 0.35
+MODEL_DEPTH_BOUNDARY_ANCHOR_TRANSLATION_PRIOR_WEIGHT = 0.40
+MODEL_DEPTH_BOUNDARY_ANCHOR_TRANSLATION_PRIOR_SIGMA_PX = 40.0
+MODEL_DEPTH_BOUNDARY_MICRO_MAX_SCALE_DELTA = 0.06
+MODEL_DEPTH_BOUNDARY_MICRO_MAX_TRANSLATION_PX = 20.0
+MODEL_DEPTH_BOUNDARY_MICRO_MAX_MEAN_DISPLACEMENT_PX = 20.0
 # Exact raster-frame closures are excluded before simplification. This smaller
 # legacy tolerance is only for old serialized contours that lack provenance.
 MODEL_DEPTH_BOUNDARY_IMAGE_BORDER_EPSILON_PX = 0.5
@@ -219,15 +265,63 @@ MODEL_DEPTH_BOUNDARY_BASE_WEIGHT = 0.35
 ENABLE_MODEL_DEPTH_PREFIT_SEMANTIC_GUIDANCE = True
 MODEL_DEPTH_PREFIT_SEMANTIC_PROMPT_LIBRARY = {
     "building": ("building",),
-    "roof": ("roof",),
+    # Fit-only roof semantics.  The broader bare-roof prompt remains separate
+    # below so vehicle roofs cannot become fitting guides while post-Hough
+    # cleanup retains its established evidence.
+    "roof": ("building roof",),
     "sky": ("sky",),
-    "vegetation": ("tree", "bush"),
+    "vegetation": ("tree", "bush", "hedge"),
     "ground": ("road", "ground"),
-    "occluder": ("vehicle",),
+    "occluder": (
+        "vehicle",
+        "person",
+        "traffic sign",
+        "signboard",
+        "advertising board",
+        "billboard",
+        "street furniture",
+        "pole",
+        "scaffolding",
+        "retaining wall",
+        "garden boundary wall",
+        "fence",
+        "gate",
+    ),
+    # Broad, category-independent proposals are kept separate from the hard
+    # prompt library and must pass component-size/target-overlap safeguards.
+    "generic_occluder": (
+        "foreground object",
+        "object in front of building",
+    ),
 }
+MODEL_DEPTH_PREFIT_DOWNSTREAM_ROOF_PROMPTS = ("roof",)
+# Require a fit roof to agree with the projected top and selected building, and
+# consume only a verified roof-to-sky/background-vegetation interface outside
+# foreground guards.  Inferred occlusion bridges are diagnostic-only.
+ENABLE_MODEL_DEPTH_PREFIT_STRICT_ROOF_GUIDANCE = True
+MODEL_DEPTH_PREFIT_STRICT_ROOF_BAND_RADIUS_PX = 18
+MODEL_DEPTH_PREFIT_STRICT_ROOF_UPPER_BUILDING_FRACTION = 0.48
+MODEL_DEPTH_PREFIT_STRICT_ROOF_ATTACHMENT_RADIUS_PX = 8
+MODEL_DEPTH_PREFIT_STRICT_ROOF_MIN_BAND_PIXELS = 12
+MODEL_DEPTH_PREFIT_STRICT_ROOF_MIN_BAND_SPAN_FRACTION = 0.03
+MODEL_DEPTH_PREFIT_STRICT_ROOF_MIN_ATTACHMENT_PIXELS = 12
+MODEL_DEPTH_PREFIT_STRICT_ROOF_MAX_FOREGROUND_FRACTION = 0.35
+MODEL_DEPTH_PREFIT_STRICT_ROOF_CONTEXT_RADIUS_PX = 3
+MODEL_DEPTH_PREFIT_STRICT_ROOF_FOREGROUND_GUARD_RADIUS_PX = 4
+MODEL_DEPTH_PREFIT_STRICT_ROOF_VEGETATION_INSET_PX = 2
+MODEL_DEPTH_PREFIT_STRICT_ROOF_VEGETATION_INSIDE_OFFSET_PX = 8
+MODEL_DEPTH_PREFIT_STRICT_ROOF_MIN_GUIDE_COMPONENT_PIXELS = 5
+ENABLE_MODEL_DEPTH_PREFIT_STRICT_ROOF_BRIDGE_DIAGNOSTIC = True
+MODEL_DEPTH_PREFIT_STRICT_ROOF_BRIDGE_MIN_ENDPOINT_RUN_PX = 3
+MODEL_DEPTH_PREFIT_STRICT_ROOF_BRIDGE_MAX_GAP_PX = 64
+MODEL_DEPTH_PREFIT_STRICT_ROOF_BRIDGE_DOMAIN_DILATION_PX = 2
 MODEL_DEPTH_PREFIT_SEARCH_MARGIN_PX = 96
 MODEL_DEPTH_PREFIT_ASSOCIATION_MARGIN_PX = 48
-MODEL_DEPTH_PREFIT_OCCLUDER_DILATION_PX = 7
+# Candidate visibility is measured on the target wall with a tighter search;
+# this avoids counting trees elsewhere in the whole-model 96 px search region.
+MODEL_DEPTH_PREFIT_TARGET_WALL_SEARCH_MARGIN_PX = 32
+MODEL_DEPTH_PREFIT_TARGET_WALL_ASSOCIATION_MARGIN_PX = 24
+MODEL_DEPTH_PREFIT_OCCLUDER_DILATION_PX = 3
 MODEL_DEPTH_PREFIT_INTERFACE_DILATION_PX = 5
 MODEL_DEPTH_PREFIT_BOUNDARY_THICKNESS_PX = 2
 # Do not let Canny/LSD or SAM boundary maps score the viewport itself.
@@ -235,6 +329,31 @@ MODEL_DEPTH_PREFIT_IMAGE_BORDER_EXCLUSION_PX = 2
 MODEL_DEPTH_PREFIT_MIN_INSTANCE_AREA_PX = 80
 MODEL_DEPTH_PREFIT_MIN_TARGET_PROJECTION_OVERLAP = 0.01
 MODEL_DEPTH_PREFIT_MAX_TARGET_INSTANCES = 4
+# High-confidence candidate rejection using the same SAM3 embedding/masks (no
+# second model inference). Missing SAM falls back to geometry+OSM; successful
+# segmentation must show meaningful building/roof support on the target wall.
+MODEL_DEPTH_PREFIT_VISIBILITY_MIN_TARGET_PIXELS = 250
+MODEL_DEPTH_PREFIT_VISIBILITY_MIN_TARGET_SUPPORT_FRACTION = 0.10
+MODEL_DEPTH_PREFIT_VISIBILITY_MAX_OCCLUDER_FRACTION = 0.80
+MODEL_DEPTH_PREFIT_VISIBILITY_LOW_SUPPORT_OCCLUDER_FRACTION = 0.60
+MODEL_DEPTH_PREFIT_VISIBILITY_MIN_LARGEST_COMPONENT_FRACTION = 0.05
+# With an anchored fit, a SAM building region many times larger than the raw
+# whole-model projection is almost certainly a foreground building that merely
+# overlaps the anchor, not the distant target.
+MODEL_DEPTH_PREFIT_VISIBILITY_MAX_TARGET_AREA_RATIO = 6.0
+MODEL_DEPTH_PREFIT_VISIBILITY_REJECT_NO_TARGET = True
+# Category-independent safeguard for foreground objects that are not returned
+# by one of the explicit prompts. Only small/medium non-target components well
+# inside a sufficiently supported raw projection suppress fitting evidence;
+# large residuals fall back to the normal target/geometry fit.
+ENABLE_MODEL_DEPTH_PREFIT_GENERIC_NON_TARGET = True
+MODEL_DEPTH_PREFIT_GENERIC_MIN_TARGET_COVERAGE = 0.20
+MODEL_DEPTH_PREFIT_GENERIC_PROJECTION_INSET_PX = 3
+MODEL_DEPTH_PREFIT_GENERIC_TARGET_DILATION_PX = 2
+MODEL_DEPTH_PREFIT_GENERIC_MIN_COMPONENT_AREA_PX = 80
+MODEL_DEPTH_PREFIT_GENERIC_MAX_COMPONENT_FRACTION = 0.20
+MODEL_DEPTH_PREFIT_GENERIC_MAX_TOTAL_FRACTION = 0.45
+MODEL_DEPTH_PREFIT_GENERIC_MAX_TARGET_OVERLAP_FRACTION = 0.15
 MODEL_DEPTH_BOUNDARY_SEMANTIC_IMAGE_WEIGHT = 1.35
 MODEL_DEPTH_BOUNDARY_SEMANTIC_IMAGE_SIGMA_PX = 6.0
 MODEL_DEPTH_BOUNDARY_MAX_SEMANTIC_SCORE_DROP = 0.03
@@ -252,21 +371,83 @@ MODEL_DEPTH_BOUNDARY_OVERLAY_LINE_THICKNESS_PX = 1
 MODEL_DEPTH_BOUNDARY_OVERLAY_DASH_LENGTH_PX = 7
 MODEL_DEPTH_BOUNDARY_OVERLAY_DASH_GAP_PX = 5
 
-# After projection crop and rectification, bounded Hough alignment runs first on
-# RGB facade edges. SAM then runs on that Hough-adjusted image and is clipped to
-# the rectified projection; the optional guarded fit remains the final refinement.
-# SAM can never erase the projection-defined facade texture.
-ENABLE_POST_RECTIFICATION_SAM = True
-POST_RECTIFICATION_SAM_MIN_PIXELS = 250
-POST_RECTIFICATION_SAM_MIN_WALL_COVERAGE = 0.15
-POST_RECTIFICATION_SAM_MAX_SCALE_DELTA = 0.08
-POST_RECTIFICATION_SAM_MAX_TRANSLATION_PX = 30.0
+# Reuse the selected candidate's full-image SAM3 building/occluder evidence for
+# facade extraction. The mask is carried through rectification, the exact Hough
+# remap, and the optional guarded affine adjustment; no second SAM3 inference is
+# run on the rectified wall.
+ENABLE_PREFIT_SEMANTIC_TEXTURE_MASK_REUSE = True
+PREFIT_SEMANTIC_TEXTURE_MIN_PIXELS = 250
+PREFIT_SEMANTIC_TEXTURE_MIN_WALL_COVERAGE = 0.35
+PREFIT_SEMANTIC_TEXTURE_CLOSE_PX = 2
+PREFIT_SEMANTIC_TEXTURE_MAX_HOLE_AREA_PX = 900
+# If a hard-prompt union covers nearly the whole fitted wall, treat it as a
+# likely broad-prompt failure in the projection fallback instead of returning
+# an empty facade. OSM exclusions remain authoritative and are never relaxed.
+PREFIT_SEMANTIC_TEXTURE_MAX_HARD_EXCLUSION_FRACTION = 0.85
+PREFIT_SEMANTIC_TEXTURE_MAX_SCALE_DELTA = 0.08
+PREFIT_SEMANTIC_TEXTURE_MAX_TRANSLATION_PX = 30.0
+SAVE_PREFIT_SEMANTIC_TEXTURE_REUSE_DEBUG = True
+
+# Remove roof-class pixels that remain inside a rectified facade after the
+# Hough warp. A roof that topologically separates the full wall polygon into
+# upper and lower partitions also removes the lower, foreground structure;
+# an isolated roof/awning removes only its own pixels. The split test uses the
+# complete wall polygon, so pre-existing texture holes cannot trigger it.
+ENABLE_POST_HOUGH_ROOF_STRUCTURE_REMOVAL = True
+POST_HOUGH_ROOF_CONNECTION_TOLERANCE_PX = 3
+POST_HOUGH_ROOF_BOUNDARY_SEED_PX = 2
+POST_HOUGH_ROOF_MIN_DIVIDER_COMPONENT_AREA_PX = 32
+POST_HOUGH_ROOF_MIN_PARTITION_AREA_PX = 80
+POST_HOUGH_ROOF_MIN_PARTITION_FRACTION = 0.03
 
 ENABLE_LAMA_FILL = True
 LAMA_MODEL_PATH = r"../lama_model/inpainting_lama_2025jan.onnx"
-LAMA_MASK_DILATE_PX = 5
+# ``auto`` prefers the official native Big-LaMa generator when its clean state
+# file and CUDA are available, and otherwise retains the fixed-512 ONNX path.
+LAMA_BACKEND = "auto"  # auto | big_lama | onnx
+BIG_LAMA_GENERATOR_PATH = r"../lama_model/big-lama/models/generator.pt"
+BIG_LAMA_DEVICE = "auto"  # auto | cuda | cpu
+BIG_LAMA_CONTEXT_PX = 128
+BIG_LAMA_MAX_SIDE_PX = 1280
+BIG_LAMA_MAX_PIXELS = 1_000_000
+# Official coarse-to-fine feature refinement is available for the largest
+# holes. Keep it opt-in until its extra runtime is acceptable for a deployment.
+BIG_LAMA_ENABLE_REFINEMENT = False
+BIG_LAMA_REFINEMENT_ITERATIONS = 15
+BIG_LAMA_REFINEMENT_LEARNING_RATE = 0.002
+BIG_LAMA_REFINEMENT_MIN_SIDE = 512
+BIG_LAMA_REFINEMENT_MAX_SCALES = 2
+BIG_LAMA_REFINEMENT_MAX_PIXELS = 400_000
+# The OpenCV ONNX export has a fixed 512x512 input.  Keep its global pass
+# aspect-ratio preserving, then refine masked regions in overlapping native-
+# resolution tiles.  This avoids stretching multi-kilopixel facade textures
+# through a single square inference.
+LAMA_ENABLE_HIGH_RES_TILING = True
+LAMA_TILE_OVERLAP_PX = 96
+LAMA_MAX_TILES = 64
+# Native tiles are used as a detail layer over the globally coherent coarse
+# prediction. Removing each tile's low-frequency residual prevents adjacent
+# 512px crops from producing visible rectangular color/exposure changes.
+LAMA_TILE_DETAIL_SIGMA_PX = 16.0
+LAMA_TILE_LOW_FREQUENCY_WEIGHT = 0.0
+LAMA_TILE_DETAIL_STRENGTH = 0.75
+LAMA_TILE_DETAIL_MAX_DELTA = 40.0
+# Zero lets ONNX Runtime choose an appropriate CPU thread pool.  Set to 1 on
+# hosts where the runtime's automatic pthread affinity messages are unwanted.
+LAMA_ONNX_INTRA_OP_THREADS = 0
+
+# The inference mask includes a small safety ring around invalid pixels.  Only
+# the original holes are replaced fully; this ring is feathered into the known
+# texture so valid facade detail remains unchanged away from the seam.
+LAMA_MASK_DILATE_PX = 8
+LAMA_COMPOSITE_FEATHER_PX = 4
 LAMA_MIN_HOLE_AREA_PX = 64
 LAMA_SAVE_DEBUG_MASK = True
+
+# Keep valid RGB below transparent texels around the wall polygon.  Alpha stays
+# zero there, but the gutter prevents bilinear/mipmap sampling from pulling
+# black into the visible texture edge in GLB/KMZ viewers.
+TEXTURE_TRANSPARENT_EDGE_BLEED_PX = 16
 
 ENABLE_MULTI_FACADE_INSTANCE_SELECTION = True
 FACADE_INSTANCE_MAX_SELECTED = 4
@@ -277,9 +458,9 @@ FACADE_INSTANCE_MIN_NEW_INSIDE_PX = 500
 FACADE_INSTANCE_MAX_DUPLICATE_INSIDE_RATIO = 0.75
 FACADE_INSTANCE_MAX_CENTER_DIST = 0.65
 
-# Optional legacy refinement: uniformly scale/translate the bounded SAM contour
-# inside the already rectified wall polygon. Depth-global alignment is now the
-# authoritative geometry, so keep this off unless explicitly experimenting.
+# Optional legacy refinement: uniformly scale/translate the retained content
+# contour inside the already rectified wall polygon. Depth-global alignment is
+# now authoritative, so keep this off unless explicitly experimenting.
 ENABLE_ORTHO_FIT = False
 ENABLE_ORTHO_POLYGON_FIT = ENABLE_ORTHO_FIT  # compatibility alias for older scripts
 POLYGON_FIT_MAX_CONTOUR_POINTS = 450
@@ -299,7 +480,7 @@ QUAD_MIN_CONTOUR_AREA_PX = 500
 FIT_CLIP_TO_WALL = True
 
 # This is both the bounded Hough diagnostic and its guided warp stage. In the
-# grouped production path it runs before post-rectification SAM.
+# grouped production path it also carries the reused full-image semantic mask.
 ENABLE_ORTHO_HOUGH_DEBUG = True
 HOUGH_SEARCH_BAND_PX = 80
 HOUGH_MIN_LENGTH_PX = 120
@@ -310,6 +491,49 @@ HOUGH_CANNY_HIGH = 150
 HOUGH_CANNY_DILATE_PX = 1
 HOUGH_USE_CLAHE = True
 HOUGH_SAVE_BAND_MASKS = False
+
+# Grouped-facade side lines must describe most of the finite projected wall
+# edge, not merely touch its search band.  These are hard acceptance gates;
+# the opening-aware solver receives only lines that pass every one.
+HOUGH_SIDE_ANGLE_THRESH_DEG = 8.0
+HOUGH_SIDE_MIN_TARGET_COVERAGE_RATIO = 0.75
+HOUGH_SIDE_MAX_LENGTH_RATIO = 1.20
+HOUGH_SIDE_MAX_DISTANCE_PX = 36.0
+HOUGH_SIDE_MAX_DISTANCE_TARGET_RATIO = 0.04
+HOUGH_SIDE_MIN_BAND_OCCUPANCY_RATIO = 0.80
+HOUGH_SIDE_MIN_EDGE_SUPPORT_RATIO = 0.30
+HOUGH_SIDE_OFFSET_CLUSTER_PX = 12.0
+
+# Inspect the two facade sides independently before the reusable SAM3 target
+# mask is clipped to the model projection.  A foreground tree/object covering
+# most of one side disables recovery on that side; sky/background does not.
+ENABLE_FACADE_SIDE_SEMANTIC_RECOVERY = True
+FACADE_SIDE_SOURCE_BAND_PX = 48
+FACADE_SIDE_FOREGROUND_OCCLUSION_RATIO = 0.50
+FACADE_SIDE_MIN_ADJACENT_VISIBLE_FRACTION = 0.08
+FACADE_SIDE_MIN_SEMANTIC_INTERFACE_SUPPORT = 0.20
+
+# Windows and doors supply the two shared Manhattan directions.  They never
+# constrain roof or ground edges, and a wall-side line is admitted only when
+# it agrees with the repeated opening orientation.
+ENABLE_OPENING_AWARE_RECTIFICATION = True
+OPENING_AWARE_PROMPT_LIBRARY = {
+    "window": ("window", "building window", "shop window"),
+    "door": ("door", "building entrance door"),
+}
+OPENING_AWARE_PROPOSAL_THRESHOLD = 0.20
+OPENING_AWARE_MIN_SAM_SCORE = 0.25
+OPENING_AWARE_MIN_STABILITY = 0.78
+OPENING_AWARE_MIN_OPENINGS = 3
+OPENING_AWARE_MAX_CONSENSUS_DEG = 5.0
+OPENING_AWARE_ALLOW_PROJECTIVE = True
+OPENING_AWARE_MAX_FINAL_SIDE_ANGLE_DEG = 2.0
+OPENING_AWARE_MAX_FINAL_SIDE_DISTANCE_PX = 8.0
+OPENING_AWARE_MAX_FINAL_P90_AXIS_ERROR_DEG = 3.0
+OPENING_AWARE_MAX_FINAL_P90_ORTHOGONALITY_ERROR_DEG = 5.0
+OPENING_AWARE_MAX_FINAL_PER_OPENING_AXIS_ERROR_DEG = 4.0
+OPENING_AWARE_MAX_FINAL_PER_OPENING_ORTHOGONALITY_ERROR_DEG = 5.0
+SAVE_OPENING_AWARE_DEBUG = True
 
 ENABLE_HOUGH_GUIDED_WARP = True
 # When just one facade side is detected, hold the missing side fixed and

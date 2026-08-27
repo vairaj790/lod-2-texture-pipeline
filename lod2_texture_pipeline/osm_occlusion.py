@@ -9,7 +9,7 @@ import json
 import math
 from pathlib import Path
 import re
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -679,6 +679,8 @@ def fetch_osm_buildings(
         "("
         f'way["building"]({bbox});'
         f'relation["building"]({bbox});'
+        f'way["building:part"]({bbox});'
+        f'relation["building:part"]({bbox});'
         ");out tags geom;"
     )
     cache_payload = {
@@ -823,18 +825,82 @@ def build_osm_blocker_meshes(
     buildings: Sequence[OSMBuilding],
     *,
     ground_z: float,
+    ground_z_sampler: Optional[Callable[[float, float], float]] = None,
+    maximum_terrain_samples: int = 9,
+    terrain_top_margin_m: float = 0.0,
+    terrain_metadata: Optional[MutableMapping[str, Mapping[str, object]]] = None,
 ) -> Tuple[List[Tuple[str, trimesh.Trimesh]], Dict[str, OSMBuilding]]:
+    """Build blocker prisms on local terrain, with a shared-base fallback.
+
+    Nearby buildings can be tens of metres above or below the target on steep
+    streets.  Extruding every footprint from the target building's ``ground_z``
+    therefore creates severe false negatives.  When a validated terrain
+    sampler is supplied, sample the footprint and span the conservative local
+    ground envelope.  The old shared base remains the deterministic fallback.
+    """
     meshes = []
     lookup = {}
     for building in buildings:
-        bottom_z = float(ground_z) + float(building.min_height_m)
-        top_z = float(ground_z) + float(building.height_m)
+        samples = []
+        sample_errors = []
+        if ground_z_sampler is not None:
+            footprint = building.footprint
+            sample_points = [footprint.representative_point(), footprint.centroid]
+            exterior = list(footprint.exterior.coords)[:-1]
+            maximum_terrain_samples = max(1, int(maximum_terrain_samples))
+            remaining = max(0, maximum_terrain_samples - len(sample_points))
+            if exterior and remaining:
+                indices = np.linspace(
+                    0,
+                    len(exterior) - 1,
+                    num=min(len(exterior), remaining),
+                    dtype=int,
+                )
+                sample_points.extend(Point(exterior[int(index)]) for index in indices)
+            seen_points = set()
+            for point in sample_points[:maximum_terrain_samples]:
+                key = (round(float(point.x), 3), round(float(point.y), 3))
+                if key in seen_points:
+                    continue
+                seen_points.add(key)
+                try:
+                    value = float(ground_z_sampler(float(point.x), float(point.y)))
+                    if math.isfinite(value):
+                        samples.append(value)
+                    else:
+                        sample_errors.append("non_finite_terrain_sample")
+                except Exception as exc:
+                    sample_errors.append(f"{type(exc).__name__}: {exc}")
+
+        terrain_used = bool(samples)
+        minimum_ground_z = min(samples) if samples else float(ground_z)
+        maximum_ground_z = max(samples) if samples else float(ground_z)
+        bottom_z = minimum_ground_z + float(building.min_height_m)
+        top_z = (
+            maximum_ground_z
+            + float(building.height_m)
+            + max(0.0, float(terrain_top_margin_m))
+        )
         mesh = _polygon_prism_mesh(building.footprint, bottom_z, top_z)
         if mesh is None:
             continue
         name = f"osm_{building.osm_type}_{building.osm_id}_part_{building.part_index}"
         meshes.append((name, mesh))
         lookup[name] = building
+        if terrain_metadata is not None:
+            terrain_metadata[name] = {
+                "terrain_used": terrain_used,
+                "terrain_sample_count": int(len(samples)),
+                "terrain_sample_error_count": int(len(sample_errors)),
+                "terrain_sample_error": sample_errors[0] if sample_errors else None,
+                "fallback_ground_z_m": float(ground_z),
+                "minimum_ground_z_m": float(minimum_ground_z),
+                "maximum_ground_z_m": float(maximum_ground_z),
+                "bottom_z_m": float(bottom_z),
+                "top_z_m": float(top_z),
+                "osm_height_m": float(building.height_m),
+                "osm_min_height_m": float(building.min_height_m),
+            }
     return meshes, lookup
 
 
@@ -844,6 +910,7 @@ def _candidate_blocker_names(
     blocker_lookup,
     *,
     corridor_buffer_m: float = 1.0,
+    require_corridor_intersection: bool = False,
 ):
     camera_point = Point(float(camera_xyz[0]), float(camera_xyz[1]))
     target_points = np.vstack(target_quads)[:, :2]
@@ -858,7 +925,10 @@ def _candidate_blocker_names(
     names = []
     for name, building in blocker_lookup.items():
         footprint = building.footprint
-        if not footprint.intersects(corridor):
+        if (
+            bool(require_corridor_intersection)
+            and not footprint.intersects(corridor)
+        ):
             continue
         if float(camera_point.distance(footprint)) >= target_distance + float(corridor_buffer_m):
             continue
@@ -876,6 +946,7 @@ def evaluate_candidate_occlusion(
     image_size: str = "640x640",
     depth_tolerance_m: float = 0.10,
     corridor_buffer_m: float = 1.0,
+    require_corridor_intersection: bool = False,
     target_alignment_H: Optional[np.ndarray] = None,
     precomputed_raw_target_depth: Optional[np.ndarray] = None,
 ) -> Dict[str, object]:
@@ -912,6 +983,7 @@ def evaluate_candidate_occlusion(
         target_quads,
         blocker_lookup,
         corridor_buffer_m=corridor_buffer_m,
+        require_corridor_intersection=require_corridor_intersection,
     )
     blocker_name_set = set(blocker_names)
     candidate_meshes = [

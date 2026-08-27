@@ -15,6 +15,15 @@ import cv2
 import numpy as np
 from scipy.optimize import minimize
 
+from .diagnostic_overlay_style import (
+    ACCEPTED_MODEL_LINE,
+    RAW_MODEL_LINE,
+    REJECTED_MODEL_LINE,
+    draw_legend,
+    draw_styled_line,
+    model_projection_legend,
+)
+
 
 @dataclass(frozen=True)
 class DepthAwareRegionFitConfig:
@@ -699,20 +708,37 @@ def create_depth_aware_region_fit_overlay(
     )
     cv2.drawContours(image, target_contours, -1, (0, 210, 0), 2, cv2.LINE_AA)
 
-    original = np.round(np.asarray(result["original_points"], dtype=np.float64)).astype(np.int32)
+    original = np.asarray(result["original_points"], dtype=np.float64)
     shown = np.asarray(
         result["fitted_points"] if result.get("applied") else result["candidate_points"],
         dtype=np.float64,
     )
-    shown = np.round(shown).astype(np.int32)
-    cv2.polylines(image, [original], True, (255, 0, 0), 2, cv2.LINE_AA)
-    color = (0, 0, 255) if result.get("applied") else (0, 165, 255)
-    cv2.polylines(image, [shown], True, color, 4, cv2.LINE_AA)
+
+    def draw_closed_outline(points: np.ndarray, style) -> None:
+        values = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+        if len(values) < 2:
+            return
+        for index in range(len(values)):
+            draw_styled_line(
+                image,
+                values[index],
+                values[(index + 1) % len(values)],
+                style,
+                color_space="bgr",
+            )
+
+    draw_closed_outline(original, RAW_MODEL_LINE)
+    shown_style = ACCEPTED_MODEL_LINE if result.get("applied") else REJECTED_MODEL_LINE
+    draw_closed_outline(shown, shown_style)
 
     transform = result.get("transform", {})
     status = "accepted" if result.get("applied") else f"rejected: {result.get('reason')}"
     rows = [
-        "green: segmentation region | blue: pre-region fit | red/orange: accepted/candidate",
+        "evidence: green=segmentation region",
+        model_projection_legend(
+            fitted=bool(result.get("applied")),
+            rejected=not bool(result.get("applied")),
+        ),
         (
             f"{status} | scale={float(transform.get('scale', 1.0)):.4f} "
             f"tx={float(transform.get('tx', 0.0)):.1f}px "
@@ -720,8 +746,5 @@ def create_depth_aware_region_fit_overlay(
             f"score gain={float(result.get('score_improvement', 0.0)):.4f}"
         ),
     ]
-    for row_index, row in enumerate(rows):
-        origin = (10, 24 + row_index * 20)
-        cv2.putText(image, row, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.43, (255, 255, 255), 3, cv2.LINE_AA)
-        cv2.putText(image, row, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.43, (20, 20, 20), 1, cv2.LINE_AA)
+    draw_legend(image, rows, color_space="bgr")
     return image

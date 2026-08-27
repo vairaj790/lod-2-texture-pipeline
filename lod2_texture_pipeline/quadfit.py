@@ -276,7 +276,9 @@ def fit_dominant_line_from_segments(
     kept_segments: List[np.ndarray],
     target_p0: np.ndarray,
     target_p1: np.ndarray,
-    edge_map_u8: np.ndarray
+    edge_map_u8: np.ndarray,
+    *,
+    extend_px: float = 20.0,
 ) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
     info = {
         "num_candidates": int(len(kept_segments)),
@@ -314,9 +316,9 @@ def fit_dominant_line_from_segments(
     tmin = float(np.min(scalars))
     tmax = float(np.max(scalars))
 
-    extend_px = 20.0
-    p_start = p + (tmin - extend_px) * v
-    p_end   = p + (tmax + extend_px) * v
+    extension = max(0.0, float(extend_px))
+    p_start = p + (tmin - extension) * v
+    p_end   = p + (tmax + extension) * v
 
     selected_line = np.vstack([p_start, p_end]).astype(np.float64)
 
@@ -338,6 +340,128 @@ def fit_dominant_line_from_segments(
 
     return selected_line, info
 
+
+def _sampled_line_support_ratio(
+    line_xy: np.ndarray,
+    mask_u8: np.ndarray,
+    *,
+    sample_step_px: float = 2.0,
+    dilation_px: int = 2,
+) -> float:
+    """Return longitudinal support, without rewarding a thick line raster."""
+    line = np.asarray(line_xy, dtype=np.float64).reshape(2, 2)
+    mask = np.asarray(mask_u8) > 0
+    if mask.ndim != 2 or not mask.any():
+        return 0.0
+    radius = max(0, int(dilation_px))
+    if radius > 0:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (2 * radius + 1, 2 * radius + 1),
+        )
+        mask = cv2.dilate(mask.astype(np.uint8), kernel, iterations=1) > 0
+    delta = line[1] - line[0]
+    length = float(np.linalg.norm(delta))
+    if length < 1.0e-9:
+        return 0.0
+    count = max(2, int(math.ceil(length / max(float(sample_step_px), 0.5))) + 1)
+    t = np.linspace(0.0, 1.0, count)
+    points = line[0][None, :] + t[:, None] * delta[None, :]
+    xs = np.rint(points[:, 0]).astype(np.int64)
+    ys = np.rint(points[:, 1]).astype(np.int64)
+    valid = (
+        (xs >= 0)
+        & (xs < mask.shape[1])
+        & (ys >= 0)
+        & (ys < mask.shape[0])
+    )
+    if not valid.any():
+        return 0.0
+    supported = np.zeros(count, dtype=bool)
+    supported[valid] = mask[ys[valid], xs[valid]]
+    return float(supported.sum() / count)
+
+
+def _line_band_occupancy_ratio(
+    line_xy: np.ndarray,
+    search_band_u8: np.ndarray,
+    *,
+    sample_step_px: float = 3.0,
+) -> float:
+    return _sampled_line_support_ratio(
+        line_xy,
+        search_band_u8,
+        sample_step_px=sample_step_px,
+        dilation_px=0,
+    )
+
+
+def _merged_interval_coverage(
+    intervals: List[Tuple[float, float]],
+    lower: float,
+    upper: float,
+    *,
+    merge_gap_px: float,
+) -> Tuple[float, float]:
+    """Return union and longest-run coverage inside a finite target segment."""
+    clipped = []
+    for start, end in intervals:
+        lo = max(float(lower), min(float(start), float(end)))
+        hi = min(float(upper), max(float(start), float(end)))
+        if hi > lo:
+            clipped.append((lo, hi))
+    if not clipped:
+        return 0.0, 0.0
+    clipped.sort()
+    merged = []
+    cur_lo, cur_hi = clipped[0]
+    for lo, hi in clipped[1:]:
+        if lo <= cur_hi + max(0.0, float(merge_gap_px)):
+            cur_hi = max(cur_hi, hi)
+        else:
+            merged.append((cur_lo, cur_hi))
+            cur_lo, cur_hi = lo, hi
+    merged.append((cur_lo, cur_hi))
+    union = float(sum(hi - lo for lo, hi in merged))
+    longest = float(max(hi - lo for lo, hi in merged))
+    target_length = max(float(upper - lower), 1.0e-9)
+    return union / target_length, longest / target_length
+
+
+def _cluster_segments_by_target_offset(
+    segments: List[np.ndarray],
+    target_p0: np.ndarray,
+    target_p1: np.ndarray,
+    tolerance_px: float,
+) -> List[List[np.ndarray]]:
+    if not segments:
+        return []
+    target = np.asarray(target_p1, dtype=np.float64) - np.asarray(
+        target_p0, dtype=np.float64
+    )
+    target /= max(float(np.linalg.norm(target)), 1.0e-9)
+    normal = np.array([-target[1], target[0]], dtype=np.float64)
+    rows = []
+    for segment in segments:
+        midpoint = np.mean(np.asarray(segment, dtype=np.float64), axis=0)
+        offset = float(np.dot(midpoint - target_p0, normal))
+        rows.append((offset, segment))
+    rows.sort(key=lambda item: item[0])
+    clusters: List[List[np.ndarray]] = []
+    cluster_offsets: List[List[float]] = []
+    for offset, segment in rows:
+        if (
+            not clusters
+            or abs(offset - float(np.median(cluster_offsets[-1])))
+            > max(1.0, float(tolerance_px))
+        ):
+            clusters.append([segment])
+            cluster_offsets.append([offset])
+        else:
+            clusters[-1].append(segment)
+            cluster_offsets[-1].append(offset)
+    return clusters
+
 def select_best_hough_line_for_target(
     lines: List[np.ndarray],
     target_p0: np.ndarray,
@@ -345,12 +469,26 @@ def select_best_hough_line_for_target(
     search_band_u8: np.ndarray,
     edge_map_u8: np.ndarray,
     min_length_px: float,
-    angle_thresh_deg: float
+    angle_thresh_deg: float,
+    *,
+    minimum_target_coverage_ratio: Optional[float] = None,
+    maximum_length_ratio: Optional[float] = None,
+    maximum_distance_px: Optional[float] = None,
+    minimum_band_occupancy_ratio: Optional[float] = None,
+    minimum_edge_support_ratio: Optional[float] = None,
+    offset_cluster_px: Optional[float] = None,
+    preferred_edge_map_u8: Optional[np.ndarray] = None,
 ) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
     target_ang = angle_deg_of_segment(target_p0, target_p1)
     H, W = search_band_u8.shape[:2]
 
     kept_segments = []
+    rejection_counts = {
+        "too_short_absolute": 0,
+        "angle_mismatch": 0,
+        "outside_search_band": 0,
+        "too_far_from_target": 0,
+    }
 
     for seg in lines:
         p0 = seg[0]
@@ -358,40 +496,232 @@ def select_best_hough_line_for_target(
 
         length = float(np.linalg.norm(p1 - p0))
         if length < min_length_px:
+            rejection_counts["too_short_absolute"] += 1
             continue
 
         ang = angle_deg_of_segment(p0, p1)
         ang_diff = angle_diff_deg_180(ang, target_ang)
         if ang_diff > angle_thresh_deg:
+            rejection_counts["angle_mismatch"] += 1
             continue
 
-        sample_pts = [
-            p0,
-            p1,
-            0.5 * (p0 + p1),
-            0.25 * p0 + 0.75 * p1,
-            0.75 * p0 + 0.25 * p1,
-        ]
-
-        inside_any = False
-        for sp in sample_pts:
-            sx = int(round(sp[0]))
-            sy = int(round(sp[1]))
-            if 0 <= sx < W and 0 <= sy < H and search_band_u8[sy, sx] > 0:
-                inside_any = True
-                break
-
-        if not inside_any:
+        band_occupancy = _line_band_occupancy_ratio(seg, search_band_u8)
+        required_band_occupancy = (
+            0.0
+            if minimum_band_occupancy_ratio is None
+            else float(minimum_band_occupancy_ratio)
+        )
+        if band_occupancy <= 0.0 or band_occupancy < required_band_occupancy:
+            rejection_counts["outside_search_band"] += 1
             continue
+
+        if maximum_distance_px is not None:
+            distances = [
+                point_line_distance(
+                    float(point[0]), float(point[1]), target_p0, target_p1
+                )
+                for point in (p0, p1, 0.5 * (p0 + p1))
+            ]
+            if float(np.percentile(distances, 90)) > float(maximum_distance_px):
+                rejection_counts["too_far_from_target"] += 1
+                continue
 
         kept_segments.append(seg)
 
-    return fit_dominant_line_from_segments(
-        kept_segments=kept_segments,
-        target_p0=target_p0,
-        target_p1=target_p1,
-        edge_map_u8=edge_map_u8
+    strict_validation = any(
+        value is not None
+        for value in (
+            minimum_target_coverage_ratio,
+            maximum_length_ratio,
+            maximum_distance_px,
+            minimum_band_occupancy_ratio,
+            minimum_edge_support_ratio,
+            offset_cluster_px,
+            preferred_edge_map_u8,
+        )
     )
+    if not strict_validation:
+        line, info = fit_dominant_line_from_segments(
+            kept_segments=kept_segments,
+            target_p0=target_p0,
+            target_p1=target_p1,
+            edge_map_u8=edge_map_u8,
+        )
+        info["rejection_counts"] = rejection_counts
+        return line, info
+
+    target_p0 = np.asarray(target_p0, dtype=np.float64)
+    target_p1 = np.asarray(target_p1, dtype=np.float64)
+    target_vector = target_p1 - target_p0
+    target_length = float(np.linalg.norm(target_vector))
+    target_direction = target_vector / max(target_length, 1.0e-9)
+    clusters = _cluster_segments_by_target_offset(
+        kept_segments,
+        target_p0,
+        target_p1,
+        12.0 if offset_cluster_px is None else float(offset_cluster_px),
+    )
+    cluster_records = []
+    for cluster_index, cluster in enumerate(clusters):
+        selected_line, fit_info = fit_dominant_line_from_segments(
+            kept_segments=cluster,
+            target_p0=target_p0,
+            target_p1=target_p1,
+            edge_map_u8=edge_map_u8,
+            extend_px=0.0,
+        )
+        if selected_line is None:
+            continue
+        intervals = []
+        for segment in cluster:
+            along = (
+                np.asarray(segment, dtype=np.float64) - target_p0[None, :]
+            ) @ target_direction
+            intervals.append((float(np.min(along)), float(np.max(along))))
+        union_coverage, continuous_coverage = _merged_interval_coverage(
+            intervals,
+            0.0,
+            target_length,
+            merge_gap_px=max(float(HOUGH_MAX_GAP_PX) * 2.0, 8.0),
+        )
+        fitted_length = float(np.linalg.norm(selected_line[1] - selected_line[0]))
+        length_ratio = fitted_length / max(target_length, 1.0e-9)
+        fitted_angle = angle_deg_of_segment(selected_line[0], selected_line[1])
+        angle_difference = angle_diff_deg_180(fitted_angle, target_ang)
+        distances = np.asarray(
+            [
+                point_line_distance(
+                    float(point[0]), float(point[1]), target_p0, target_p1
+                )
+                for point in (
+                    selected_line[0],
+                    selected_line[1],
+                    0.5 * (selected_line[0] + selected_line[1]),
+                )
+            ],
+            dtype=np.float64,
+        )
+        p90_distance = float(np.percentile(distances, 90))
+        band_occupancy = _line_band_occupancy_ratio(
+            selected_line, search_band_u8
+        )
+        edge_support = _sampled_line_support_ratio(
+            selected_line, edge_map_u8
+        )
+        preferred_support = (
+            0.0
+            if preferred_edge_map_u8 is None
+            else _sampled_line_support_ratio(
+                selected_line, preferred_edge_map_u8
+            )
+        )
+        reasons = []
+        minimum_coverage = float(minimum_target_coverage_ratio or 0.0)
+        if union_coverage < minimum_coverage:
+            reasons.append("insufficient_target_length_coverage")
+        if continuous_coverage < minimum_coverage:
+            reasons.append("insufficient_continuous_target_support")
+        if length_ratio < minimum_coverage:
+            reasons.append("fitted_line_too_short_relative_to_target")
+        if maximum_length_ratio is not None and length_ratio > float(maximum_length_ratio):
+            reasons.append("fitted_line_too_long_relative_to_target")
+        if angle_difference > float(angle_thresh_deg):
+            reasons.append("fitted_angle_mismatch")
+        if maximum_distance_px is not None and p90_distance > float(maximum_distance_px):
+            reasons.append("fitted_line_too_far_from_target")
+        if (
+            minimum_band_occupancy_ratio is not None
+            and band_occupancy < float(minimum_band_occupancy_ratio)
+        ):
+            reasons.append("insufficient_search_band_occupancy")
+        if (
+            minimum_edge_support_ratio is not None
+            and edge_support < float(minimum_edge_support_ratio)
+        ):
+            reasons.append("insufficient_longitudinal_edge_support")
+        distance_score = 1.0 - min(
+            p90_distance / max(float(maximum_distance_px or 1.0), 1.0), 1.0
+        )
+        angle_score = 1.0 - min(
+            angle_difference / max(float(angle_thresh_deg), 1.0), 1.0
+        )
+        score = float(
+            3.0 * min(union_coverage, 1.0)
+            + 2.0 * min(continuous_coverage, 1.0)
+            + 1.5 * edge_support
+            + 1.5 * preferred_support
+            + distance_score
+            + angle_score
+        )
+        cluster_records.append({
+            "cluster_index": int(cluster_index),
+            "segment_count": int(len(cluster)),
+            "selected_line": selected_line,
+            "fit_info": fit_info,
+            "target_union_coverage_ratio": float(union_coverage),
+            "target_continuous_coverage_ratio": float(continuous_coverage),
+            "length_ratio_to_target": float(length_ratio),
+            "angle_diff_deg": float(angle_difference),
+            "p90_distance_px": p90_distance,
+            "band_occupancy_ratio": float(band_occupancy),
+            "edge_support_ratio": float(edge_support),
+            "preferred_edge_support_ratio": float(preferred_support),
+            "score": score,
+            "rejection_reasons": reasons,
+        })
+
+    accepted = [row for row in cluster_records if not row["rejection_reasons"]]
+    best = max(accepted, key=lambda row: row["score"]) if accepted else None
+    serializable_clusters = [
+        {
+            key: value
+            for key, value in row.items()
+            if key not in {"selected_line", "fit_info"}
+        }
+        for row in cluster_records
+    ]
+    info = {
+        "num_candidates": int(len(kept_segments)),
+        "num_offset_clusters": int(len(cluster_records)),
+        "rejection_counts": rejection_counts,
+        "cluster_diagnostics": serializable_clusters,
+        "validation_enabled": True,
+        "best_length_px": None,
+        "best_angle_diff_deg": None,
+        "best_distance_px": None,
+        "best_overlap_ratio": None,
+        "target_length_px": float(target_length),
+    }
+    if best is None:
+        info["rejection_reason"] = (
+            "no_cluster_passed_relative_length_distance_and_support_gates"
+            if cluster_records
+            else "no_candidate_segment_passed_basic_gates"
+        )
+        return None, info
+
+    info.update({
+        "selected_cluster_index": int(best["cluster_index"]),
+        "selected_segment_count": int(best["segment_count"]),
+        "best_length_px": float(
+            np.linalg.norm(best["selected_line"][1] - best["selected_line"][0])
+        ),
+        "best_angle_diff_deg": float(best["angle_diff_deg"]),
+        "best_distance_px": float(best["p90_distance_px"]),
+        "best_overlap_ratio": float(best["edge_support_ratio"]),
+        "target_union_coverage_ratio": float(best["target_union_coverage_ratio"]),
+        "target_continuous_coverage_ratio": float(
+            best["target_continuous_coverage_ratio"]
+        ),
+        "length_ratio_to_target": float(best["length_ratio_to_target"]),
+        "band_occupancy_ratio": float(best["band_occupancy_ratio"]),
+        "preferred_edge_support_ratio": float(
+            best["preferred_edge_support_ratio"]
+        ),
+        "selection_score": float(best["score"]),
+        "rejection_reason": None,
+    })
+    return np.asarray(best["selected_line"], dtype=np.float64), info
 
 def save_hough_all_lines_overlay(
     img_pil: Image.Image,
@@ -642,7 +972,9 @@ def apply_hough_guided_ortho_warp(
     sel_top_line: Optional[np.ndarray],
     proj_left_line: np.ndarray,
     proj_right_line: np.ndarray,
-    proj_top_line: Optional[np.ndarray]
+    proj_top_line: Optional[np.ndarray],
+    *,
+    interpolation: int = cv2.INTER_LINEAR,
 ) -> np.ndarray:
     """
     Two-stage inverse remap in ortho space:
@@ -717,9 +1049,9 @@ def apply_hough_guided_ortho_warp(
         ortho_rgba,
         map_x_h,
         map_y_h,
-        interpolation=cv2.INTER_LINEAR,
+        interpolation=int(interpolation),
         borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0, 0)
+        borderValue=0,
     )
 
     if sel_top_line is None or proj_top_line is None:
@@ -751,9 +1083,9 @@ def apply_hough_guided_ortho_warp(
         ortho_rgba_h,
         map_x_v,
         map_y_v,
-        interpolation=cv2.INTER_LINEAR,
+        interpolation=int(interpolation),
         borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0, 0)
+        borderValue=0,
     )
 
     return ortho_rgba_hv

@@ -13,6 +13,16 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
+from .diagnostic_overlay_style import (
+    ACCEPTED_MODEL_LINE,
+    RAW_MODEL_LINE,
+    REJECTED_MODEL_LINE,
+    OverlayLineStyle,
+    draw_legend,
+    draw_styled_line,
+    model_projection_legend,
+)
+
 
 @dataclass(frozen=True)
 class WireframeFitConfig:
@@ -71,6 +81,21 @@ class WireframeFitConfig:
     translation_prior_sigma_x: float = 90.0
     translation_prior_sigma_y: float = 85.0
     rotation_prior_sigma_deg: float = 7.0
+
+    # Optional hard anchor envelope.  The allowed translation is the smaller
+    # of the absolute cap and a reference-span fraction, with a small floor for
+    # low-resolution/distant targets. ``None`` keeps legacy behavior.
+    maximum_translation_x_px: Optional[float] = None
+    maximum_translation_y_px: Optional[float] = None
+    maximum_translation_norm_px: Optional[float] = None
+    maximum_translation_norm_fraction: Optional[float] = None
+    maximum_translation_fraction_x: Optional[float] = None
+    maximum_translation_fraction_y: Optional[float] = None
+    minimum_translation_allowance_x_px: float = 0.0
+    minimum_translation_allowance_y_px: float = 0.0
+    maximum_mean_displacement_px: Optional[float] = None
+    maximum_mean_displacement_fraction: Optional[float] = None
+    minimum_anchor_iou: float = 0.0
 
     # Production acceptance gate. The standalone experiment always returned
     # the numerical winner; production only applies a useful improvement.
@@ -137,6 +162,32 @@ def _scaled_search_config(config: WireframeFitConfig, image_shape_hw) -> Wirefra
         semantic_boundary_sigma_px=config.semantic_boundary_sigma_px * factor,
         translation_prior_sigma_x=config.translation_prior_sigma_x * factor,
         translation_prior_sigma_y=config.translation_prior_sigma_y * factor,
+        maximum_translation_x_px=(
+            None
+            if config.maximum_translation_x_px is None
+            else config.maximum_translation_x_px * factor
+        ),
+        maximum_translation_y_px=(
+            None
+            if config.maximum_translation_y_px is None
+            else config.maximum_translation_y_px * factor
+        ),
+        maximum_translation_norm_px=(
+            None
+            if config.maximum_translation_norm_px is None
+            else config.maximum_translation_norm_px * factor
+        ),
+        minimum_translation_allowance_x_px=(
+            config.minimum_translation_allowance_x_px * factor
+        ),
+        minimum_translation_allowance_y_px=(
+            config.minimum_translation_allowance_y_px * factor
+        ),
+        maximum_mean_displacement_px=(
+            None
+            if config.maximum_mean_displacement_px is None
+            else config.maximum_mean_displacement_px * factor
+        ),
         minimum_mean_vertex_displacement_px=(
             config.minimum_mean_vertex_displacement_px * max(factor, 1.0)
         ),
@@ -561,6 +612,155 @@ def _sample_valid_evidence(valid_evidence_mask, points_xy):
     return values.reshape(-1) > 0
 
 
+def semantic_boundary_alignment_score(
+    points_px: np.ndarray,
+    segment_indices: Sequence[Tuple[int, int]],
+    segment_classes: Sequence[str],
+    segment_weights: Sequence[float],
+    semantic_boundary_maps: Mapping[str, np.ndarray],
+    image_shape_hw: Tuple[int, int],
+    *,
+    config: Optional[WireframeFitConfig] = None,
+    included_classes: Optional[Sequence[str]] = None,
+) -> Dict[str, object]:
+    """Evaluate model segments against semantic guides on one common mask.
+
+    This diagnostic is intentionally independent of raw-image evidence masks.
+    It lets the pipeline compare an incumbent and a background-aware challenger
+    against the exact same complete roof/sky guide before choosing either fit.
+    """
+    points = np.asarray(points_px, dtype=np.float64)
+    shape = (int(image_shape_hw[0]), int(image_shape_hw[1]))
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError("Semantic alignment points must be an Nx2 array.")
+    segments = _validated_segment_indices(len(points), segment_indices)
+    classes = _validated_segment_classes(len(segments), segment_classes)
+    weights = _validated_segment_weights(len(segments), segment_weights)
+    selected_classes = (
+        None
+        if included_classes is None
+        else {str(value).strip().lower() for value in included_classes}
+    )
+    if selected_classes is not None:
+        keep = np.asarray(
+            [label in selected_classes for label in classes],
+            dtype=bool,
+        )
+        if not keep.any():
+            return {"score": 0.0, "sample_count": 0, "classes": []}
+        weights = weights.copy()
+        weights[~keep] = 0.0
+
+    score_config = _scaled_search_config(
+        config or WireframeFitConfig(),
+        shape,
+    )
+    semantic_score_maps = _create_semantic_boundary_score_maps(
+        semantic_boundary_maps,
+        shape,
+        score_config,
+    )
+    score_stack, segment_channels = _prepare_semantic_boundary_sampling(
+        semantic_score_maps,
+        classes,
+    )
+    visible = visible_segments_from_points(
+        points,
+        segments,
+        shape,
+        score_config,
+    )
+    samples, sample_weights, source_indices = (
+        _sample_visible_segments_with_weights_and_indices(
+            visible,
+            score_config.boundary_sample_step_px,
+            weights,
+        )
+    )
+    semantic_values, semantic_available = _sample_semantic_boundary_scores(
+        score_stack,
+        samples,
+        source_indices,
+        segment_channels,
+    )
+    usable = semantic_available & (sample_weights > 0.0)
+    if not usable.any() or float(sample_weights[usable].sum()) <= 0.0:
+        return {
+            "score": 0.0,
+            "sample_count": 0,
+            "classes": sorted(selected_classes or set(classes)),
+        }
+    return {
+        "score": float(np.average(
+            semantic_values[usable],
+            weights=sample_weights[usable],
+        )),
+        "sample_count": int(usable.sum()),
+        "classes": sorted(selected_classes or set(classes)),
+    }
+
+
+def _anchored_translation_limits(points, config):
+    points = np.asarray(points, dtype=np.float64)
+    spans = np.ptp(points, axis=0) if len(points) else np.zeros((2,))
+
+    def axis_limit(absolute_cap, fraction, minimum_allowance, span):
+        candidates = []
+        if absolute_cap is not None:
+            candidates.append(float(max(0.0, absolute_cap)))
+        if fraction is not None:
+            relative = max(
+                float(max(0.0, minimum_allowance)),
+                float(max(0.0, fraction)) * float(max(0.0, span)),
+            )
+            candidates.append(relative)
+        return min(candidates) if candidates else float("inf")
+
+    reference_extent = float(max(spans[0], spans[1], 1.0))
+    norm_candidates = []
+    if config.maximum_translation_norm_px is not None:
+        norm_candidates.append(float(max(0.0, config.maximum_translation_norm_px)))
+    if config.maximum_translation_norm_fraction is not None:
+        norm_candidates.append(
+            float(max(0.0, config.maximum_translation_norm_fraction))
+            * reference_extent
+        )
+    norm_limit = min(norm_candidates) if norm_candidates else float("inf")
+    return (
+        axis_limit(
+            config.maximum_translation_x_px,
+            config.maximum_translation_fraction_x,
+            config.minimum_translation_allowance_x_px,
+            spans[0],
+        ),
+        axis_limit(
+            config.maximum_translation_y_px,
+            config.maximum_translation_fraction_y,
+            config.minimum_translation_allowance_y_px,
+            spans[1],
+        ),
+        norm_limit,
+        reference_extent,
+    )
+
+
+def _convex_anchor_iou(points0, points1, image_shape_hw):
+    points0 = np.asarray(points0, dtype=np.float64)
+    points1 = np.asarray(points1, dtype=np.float64)
+    if len(points0) < 3 or len(points1) < 3:
+        return 1.0
+    height, width = image_shape_hw
+    mask0 = np.zeros((height, width), dtype=np.uint8)
+    mask1 = np.zeros((height, width), dtype=np.uint8)
+    hull0 = cv2.convexHull(points0.astype(np.float32)).reshape(-1, 2)
+    hull1 = cv2.convexHull(points1.astype(np.float32)).reshape(-1, 2)
+    cv2.fillPoly(mask0, [np.round(hull0).astype(np.int32)], 1)
+    cv2.fillPoly(mask1, [np.round(hull1).astype(np.int32)], 1)
+    intersection = int(np.logical_and(mask0, mask1).sum())
+    union = int(np.logical_or(mask0, mask1).sum())
+    return float(intersection / union) if union > 0 else 1.0
+
+
 def _score_candidate(
     candidate_points,
     segment_indices,
@@ -576,6 +776,7 @@ def _score_candidate(
     valid_evidence_mask,
     semantic_score_stack,
     segment_semantic_channels,
+    semantic_valid_evidence_mask=None,
 ):
     def rejected_diagnostics(visible_length, excluded_sample_count=0):
         return {
@@ -594,6 +795,7 @@ def _score_candidate(
             "evidence_sample_count": 0,
             "excluded_evidence_sample_count": int(excluded_sample_count),
             "semantic_evidence_sample_count": 0,
+            "excluded_semantic_evidence_sample_count": 0,
         }
 
     visible = visible_segments_from_points(candidate_points, segment_indices, image_shape_hw, config)
@@ -619,26 +821,48 @@ def _score_candidate(
     )
     evidence_samples = _sample_valid_evidence(valid_evidence_mask, samples)
     excluded_sample_count = int(len(evidence_samples) - evidence_samples.sum())
-    values = values[evidence_samples]
-    sample_weights = sample_weights[evidence_samples]
-    semantic_values = semantic_values[evidence_samples]
-    semantic_available = semantic_available[evidence_samples]
-    if len(values) == 0 or float(sample_weights.sum()) <= 0.0:
+    raw_values = values[evidence_samples]
+    raw_sample_weights = sample_weights[evidence_samples]
+    if len(raw_values) == 0 or float(raw_sample_weights.sum()) <= 0.0:
         return -1.0e9, rejected_diagnostics(
             visible_length,
             excluded_sample_count,
         )
 
+    # Preserve the historical coupling unless a caller explicitly supplies a
+    # semantic validity mask.  The background-aware fit uses an independent
+    # mask so foreground pixels cannot contribute Canny/LSD evidence while the
+    # complete SAM roof/sky guide remains available as semantic evidence.
+    effective_semantic_valid_mask = (
+        valid_evidence_mask
+        if semantic_valid_evidence_mask is None
+        else semantic_valid_evidence_mask
+    )
+    semantic_evidence_samples = _sample_valid_evidence(
+        effective_semantic_valid_mask,
+        samples,
+    )
+    excluded_semantic_sample_count = int(
+        len(semantic_evidence_samples) - semantic_evidence_samples.sum()
+    )
+
     edge_score = float(np.average(
-        np.exp(-values[:, 0] / config.edge_distance_sigma_px),
-        weights=sample_weights,
+        np.exp(-raw_values[:, 0] / config.edge_distance_sigma_px),
+        weights=raw_sample_weights,
     ))
     line_score = float(np.average(
-        np.exp(-values[:, 1] / config.line_distance_sigma_px),
-        weights=sample_weights,
+        np.exp(-raw_values[:, 1] / config.line_distance_sigma_px),
+        weights=raw_sample_weights,
     ))
-    gradient_score = float(np.average(values[:, 2], weights=sample_weights))
-    semantic_available = semantic_available & (sample_weights > 0.0)
+    gradient_score = float(np.average(
+        raw_values[:, 2],
+        weights=raw_sample_weights,
+    ))
+    semantic_available = (
+        semantic_available
+        & semantic_evidence_samples
+        & (sample_weights > 0.0)
+    )
     semantic_evidence_sample_count = int(semantic_available.sum())
     semantic_weight_sum = float(sample_weights[semantic_available].sum())
     semantic_score = (
@@ -682,9 +906,12 @@ def _score_candidate(
         "translation_prior": translation_prior,
         "rotation_prior": rotation_prior,
         "visible_segment_count": int(len(visible)),
-        "evidence_sample_count": int(len(values)),
+        "evidence_sample_count": int(len(raw_values)),
         "excluded_evidence_sample_count": excluded_sample_count,
         "semantic_evidence_sample_count": semantic_evidence_sample_count,
+        "excluded_semantic_evidence_sample_count": (
+            excluded_semantic_sample_count
+        ),
     }
     return float(score), diagnostics
 
@@ -699,6 +926,7 @@ def _search_best_transform(
     valid_evidence_mask,
     semantic_score_stack,
     segment_semantic_channels,
+    semantic_valid_evidence_mask=None,
 ):
     center = _choose_transform_center(
         points,
@@ -711,6 +939,12 @@ def _search_best_transform(
     reference_length = _weighted_visible_length(reference, segment_weights)
     if reference_length <= 0.0:
         raise RuntimeError("No real wireframe segments are visible in the image.")
+    (
+        maximum_tx,
+        maximum_ty,
+        maximum_translation_norm,
+        reference_extent,
+    ) = _anchored_translation_limits(points, config)
 
     identity_score, identity_diagnostics = _score_candidate(
         points, segment_indices, 1.0, 0.0, 0.0, 0.0,
@@ -718,6 +952,7 @@ def _search_best_transform(
         valid_evidence_mask,
         semantic_score_stack,
         segment_semantic_channels,
+        semantic_valid_evidence_mask,
     )
     identity_evidence_sample_count = int(
         identity_diagnostics.get("evidence_sample_count", 0)
@@ -738,6 +973,14 @@ def _search_best_transform(
             for rotation in rotation_values:
                 for tx in tx_values:
                     for ty in ty_values:
+                        if abs(float(tx)) > maximum_tx + 1.0e-6:
+                            continue
+                        if abs(float(ty)) > maximum_ty + 1.0e-6:
+                            continue
+                        if math.hypot(float(tx), float(ty)) > (
+                            maximum_translation_norm + 1.0e-6
+                        ):
+                            continue
                         candidate = transform_points_similarity(points, scale, rotation, tx, ty, center)
                         score, diagnostics = _score_candidate(
                             candidate, segment_indices, scale, rotation, tx, ty,
@@ -746,6 +989,7 @@ def _search_best_transform(
                             valid_evidence_mask,
                             semantic_score_stack,
                             segment_semantic_channels,
+                            semantic_valid_evidence_mask,
                         )
                         if valid_evidence_mask is not None:
                             evidence_retention_ratio = float(
@@ -833,15 +1077,38 @@ def _search_best_transform(
         ) if config.allow_rotation else np.array([0.0], dtype=np.float32)
     )
     best = evaluate(
-        _make_range(best["scale"] - config.fine_scale_radius, best["scale"] + config.fine_scale_radius, config.fine_scale_step),
+        _make_range(
+            max(config.coarse_scale_min, best["scale"] - config.fine_scale_radius),
+            min(config.coarse_scale_max, best["scale"] + config.fine_scale_radius),
+            config.fine_scale_step,
+        ),
         fine_rotations,
-        _make_range(best["tx"] - config.fine_tx_radius, best["tx"] + config.fine_tx_radius, config.fine_tx_step),
-        _make_range(best["ty"] - config.fine_ty_radius, best["ty"] + config.fine_ty_radius, config.fine_ty_step),
+        _make_range(
+            max(config.coarse_tx_min, best["tx"] - config.fine_tx_radius),
+            min(config.coarse_tx_max, best["tx"] + config.fine_tx_radius),
+            config.fine_tx_step,
+        ),
+        _make_range(
+            max(config.coarse_ty_min, best["ty"] - config.fine_ty_radius),
+            min(config.coarse_ty_max, best["ty"] + config.fine_ty_radius),
+            config.fine_ty_step,
+        ),
         best,
     )
     best["transform_center_x"] = float(center[0])
     best["transform_center_y"] = float(center[1])
     best["reference_visible_length"] = float(reference_length)
+    best["maximum_translation_x_px"] = (
+        float(maximum_tx) if math.isfinite(maximum_tx) else None
+    )
+    best["maximum_translation_y_px"] = (
+        float(maximum_ty) if math.isfinite(maximum_ty) else None
+    )
+    best["maximum_translation_norm_px"] = (
+        float(maximum_translation_norm)
+        if math.isfinite(maximum_translation_norm) else None
+    )
+    best["reference_extent_px"] = float(reference_extent)
     return best, identity_diagnostics, center, segment_indices
 
 
@@ -852,6 +1119,7 @@ def fit_wireframe_to_image(
     segment_indices: Optional[Sequence[Tuple[int, int]]] = None,
     segment_weights: Optional[Sequence[float]] = None,
     valid_evidence_mask: Optional[np.ndarray] = None,
+    semantic_valid_evidence_mask: Optional[np.ndarray] = None,
     segment_classes: Optional[Sequence[str]] = None,
     semantic_boundary_maps: Optional[Mapping[str, np.ndarray]] = None,
 ) -> Dict[str, object]:
@@ -877,6 +1145,15 @@ def fit_wireframe_to_image(
         if valid_evidence_mask.shape != image_bgr.shape[:2]:
             raise ValueError(
                 "Wireframe fitting evidence mask must match the image height and width."
+            )
+    if semantic_valid_evidence_mask is not None:
+        semantic_valid_evidence_mask = np.asarray(
+            semantic_valid_evidence_mask,
+            dtype=bool,
+        )
+        if semantic_valid_evidence_mask.shape != image_bgr.shape[:2]:
+            raise ValueError(
+                "Semantic fitting evidence mask must match the image height and width."
             )
     canny, line_map, score_maps = _create_score_maps(
         image_bgr,
@@ -905,6 +1182,7 @@ def fit_wireframe_to_image(
         valid_evidence_mask,
         semantic_score_stack,
         segment_semantic_channels,
+        semantic_valid_evidence_mask,
     )
     candidate_points = transform_points_similarity(
         points, best["scale"], best["rotation_deg"], best["tx"], best["ty"], center,
@@ -913,6 +1191,35 @@ def fit_wireframe_to_image(
     mean_vertex_displacement = float(
         np.mean(np.linalg.norm(candidate_points - points, axis=1))
     )
+    reference_extent = float(max(
+        np.ptp(points[:, 0]),
+        np.ptp(points[:, 1]),
+        1.0,
+    ))
+    translation_norm = float(math.hypot(best["tx"], best["ty"]))
+    displacement_fraction = float(mean_vertex_displacement / reference_extent)
+    displacement_limits = []
+    if search_config.maximum_mean_displacement_px is not None:
+        displacement_limits.append(float(
+            search_config.maximum_mean_displacement_px
+        ))
+    if search_config.maximum_mean_displacement_fraction is not None:
+        displacement_limits.append(
+            float(search_config.maximum_mean_displacement_fraction)
+            * reference_extent
+        )
+    maximum_mean_displacement = (
+        min(displacement_limits) if displacement_limits else float("inf")
+    )
+    motion_ok = bool(
+        mean_vertex_displacement <= maximum_mean_displacement + 1.0e-6
+    )
+    anchor_iou = _convex_anchor_iou(
+        points,
+        candidate_points,
+        image_bgr.shape[:2],
+    )
+    anchor_ok = bool(anchor_iou + 1.0e-9 >= search_config.minimum_anchor_iou)
     edge_ok = best["edge_distance_score"] >= (
         identity_diagnostics["edge_distance_score"] - search_config.maximum_edge_score_drop
     )
@@ -947,6 +1254,8 @@ def fit_wireframe_to_image(
         and line_ok
         and semantic_ok
         and evidence_ok
+        and motion_ok
+        and anchor_ok
     )
     if applied:
         reason = "accepted_score_improvement"
@@ -956,7 +1265,11 @@ def fit_wireframe_to_image(
         )
     else:
         reason = (
-            "insufficient_unmasked_boundary_evidence"
+            "motion_exceeds_original_projection_anchor"
+            if not motion_ok
+            else "original_projection_anchor_iou_below_threshold"
+            if not anchor_ok
+            else "insufficient_unmasked_boundary_evidence"
             if not evidence_ok
             else "semantic_boundary_score_drop"
             if not semantic_ok
@@ -982,6 +1295,15 @@ def fit_wireframe_to_image(
         "score_after": float(best["score"]),
         "score_improvement": score_improvement,
         "mean_vertex_displacement_px": mean_vertex_displacement,
+        "mean_vertex_displacement_fraction": displacement_fraction,
+        "maximum_mean_vertex_displacement_px": (
+            float(maximum_mean_displacement)
+            if math.isfinite(maximum_mean_displacement) else None
+        ),
+        "translation_norm_px": translation_norm,
+        "anchor_iou": anchor_iou,
+        "anchor_motion_gate_passed": motion_ok,
+        "anchor_iou_gate_passed": anchor_ok,
         "diagnostics_before": identity_diagnostics,
         "canny": canny,
         "line_map": line_map,
@@ -1003,6 +1325,18 @@ def fit_wireframe_to_image(
             int(valid_evidence_mask.size - valid_evidence_mask.sum())
             if valid_evidence_mask is not None
             else 0
+        ),
+        "semantic_valid_evidence_pixel_count": (
+            int(semantic_valid_evidence_mask.sum())
+            if semantic_valid_evidence_mask is not None
+            else (
+                int(valid_evidence_mask.sum())
+                if valid_evidence_mask is not None
+                else int(image_bgr.shape[0] * image_bgr.shape[1])
+            )
+        ),
+        "semantic_evidence_mask_independent": bool(
+            semantic_valid_evidence_mask is not None
         ),
     }
 
@@ -1028,6 +1362,20 @@ def wireframe_fit_metadata(result: Optional[Dict[str, object]]) -> Optional[Dict
         "score_after": float(result.get("score_after", 0.0)),
         "score_improvement": float(result.get("score_improvement", 0.0)),
         "mean_vertex_displacement_px": float(result.get("mean_vertex_displacement_px", 0.0)),
+        "mean_vertex_displacement_fraction": float(
+            result.get("mean_vertex_displacement_fraction", 0.0)
+        ),
+        "maximum_mean_vertex_displacement_px": result.get(
+            "maximum_mean_vertex_displacement_px"
+        ),
+        "translation_norm_px": float(result.get("translation_norm_px", 0.0)),
+        "anchor_iou": float(result.get("anchor_iou", 1.0)),
+        "anchor_motion_gate_passed": bool(
+            result.get("anchor_motion_gate_passed", True)
+        ),
+        "anchor_iou_gate_passed": bool(
+            result.get("anchor_iou_gate_passed", True)
+        ),
         "semantic_guidance_active": bool(
             result.get("semantic_guidance_active", False)
         ),
@@ -1042,6 +1390,15 @@ def wireframe_fit_metadata(result: Optional[Dict[str, object]]) -> Optional[Dict
         ),
         "masked_evidence_gate_passed": bool(
             result.get("masked_evidence_gate_passed", True)
+        ),
+        "valid_evidence_pixel_count": int(
+            result.get("valid_evidence_pixel_count", 0)
+        ),
+        "semantic_valid_evidence_pixel_count": int(
+            result.get("semantic_valid_evidence_pixel_count", 0)
+        ),
+        "semantic_evidence_mask_independent": bool(
+            result.get("semantic_evidence_mask_independent", False)
         ),
         "H_original_to_fitted": np.asarray(result.get("homography", np.eye(3))).astype(float).tolist(),
         "original_outline_px": np.asarray(result.get("original_points", [])).astype(float).tolist(),
@@ -1059,40 +1416,56 @@ def wireframe_fit_metadata(result: Optional[Dict[str, object]]) -> Optional[Dict
     }
 
 
-def _draw_segments(image, points, segment_indices, config, color, thickness):
+def _draw_segments(
+    image,
+    points,
+    segment_indices,
+    config,
+    style: OverlayLineStyle,
+):
     segments = visible_segments_from_points(
         np.asarray(points, dtype=np.float64), segment_indices, image.shape[:2], config,
     )
     for segment in segments:
-        p0 = tuple(np.round(segment.start).astype(int))
-        p1 = tuple(np.round(segment.end).astype(int))
-        cv2.line(image, p0, p1, color, thickness, cv2.LINE_AA)
+        draw_styled_line(
+            image,
+            segment.start,
+            segment.end,
+            style,
+            color_space="bgr",
+        )
 
 
 def create_wireframe_fit_overlay(image_bgr, result, config=None):
-    """Draw original projection in blue and accepted/candidate fit in red."""
+    """Draw the original projection and accepted/rejected fit consistently."""
     image = np.asarray(image_bgr, dtype=np.uint8).copy()
     config = _scaled_search_config(config or WireframeFitConfig(), image.shape[:2])
     segment_indices = result["segment_indices"]
-    _draw_segments(image, result["original_points"], segment_indices, config, (255, 0, 0), 2)
+    _draw_segments(
+        image,
+        result["original_points"],
+        segment_indices,
+        config,
+        RAW_MODEL_LINE,
+    )
     shown_points = result["fitted_points"] if result.get("applied") else result["candidate_points"]
-    shown_color = (0, 0, 255) if result.get("applied") else (0, 165, 255)
-    _draw_segments(image, shown_points, segment_indices, config, shown_color, 4)
+    shown_style = ACCEPTED_MODEL_LINE if result.get("applied") else REJECTED_MODEL_LINE
+    _draw_segments(image, shown_points, segment_indices, config, shown_style)
     transform = result["transform"]
     status = result.get(
         "status_label",
         "accepted" if result.get("applied") else "rejected candidate",
     )
     rows = [
-        "blue: original projection | red: accepted fit | orange: rejected candidate",
+        model_projection_legend(
+            fitted=bool(result.get("applied")),
+            rejected=not bool(result.get("applied")),
+        ),
         (
             f"{status} | scale={transform['scale']:.4f} "
             f"tx={transform['tx']:.1f}px ty={transform['ty']:.1f}px "
             f"score gain={result['score_improvement']:.4f}"
         ),
     ]
-    for row_idx, text in enumerate(rows):
-        origin = (10, 24 + row_idx * 20)
-        cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 255, 255), 3, cv2.LINE_AA)
-        cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.46, (25, 25, 25), 1, cv2.LINE_AA)
+    draw_legend(image, rows, color_space="bgr")
     return image

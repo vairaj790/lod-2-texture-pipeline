@@ -13,7 +13,7 @@ import traceback
 import zipfile
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 import cv2
 import numpy as np
@@ -24,6 +24,20 @@ from PIL import Image, ImageDraw
 from shapely.geometry import Point
 
 from .config import *
+from .diagnostic_overlay_style import (
+    ACCEPTED_MODEL_LINE,
+    BACKGROUND_AWARE_SEMANTIC_LEGEND_ROWS,
+    OSM_LEGEND_ROW,
+    OSM_OBSTRUCTION_LINE,
+    RAW_MODEL_LINE,
+    SEARCH_LEGEND_ROW,
+    SEMANTIC_LEGEND_ROWS,
+    STRICT_ROOF_AUDIT_LEGEND_ROW,
+    OverlayLineStyle,
+    draw_legend,
+    draw_styled_line,
+    model_projection_legend,
+)
 from .depth_boundary_fit import (
     create_depth_boundary_fit_overlay,
     create_depth_silhouette_shift_overlay,
@@ -34,7 +48,16 @@ from .depth_boundary_fit import (
     project_semantic_model_boundary_edges,
 )
 from .facade_alignment import facade_alignment_metadata, select_facade_alignment
-from .facade_refinement import constrain_post_rectification_sam_mask
+from .facade_refinement import (
+    build_post_hough_roof_structure_removal,
+    build_reused_prefit_facade_mask,
+)
+from .facade_side_evidence import (
+    analyze_source_side_evidence,
+    build_adjacent_wall_contexts,
+    side_evidence_metadata,
+    warp_side_evidence_to_rectified,
+)
 from .depth_aware_region_fit import (
     DepthAwareRegionFitConfig,
     create_depth_aware_region_fit_overlay,
@@ -48,8 +71,19 @@ from .dgm_elevation import (
     unique_base_vertices_from_edges,
 )
 from .geojson_io import build_edge_loops_from_gdf, load_3d_geojson
-from .inpainting import build_wall_region_mask, lama_fill_rectified_wall
-from .mesh import _build_wall_mesh_from_verts, build_closed_roof_polygons, build_trimesh_from_surface_face, rasterize_polygons_to_mask, triangulate_surface
+from .inpainting import (
+    bleed_rgb_into_transparency,
+    build_wall_region_mask,
+    lama_fill_rectified_wall,
+)
+from .mesh import (
+    _build_wall_mesh_from_verts,
+    build_closed_roof_polygons,
+    build_trimesh_from_surface_face,
+    rasterize_polygons_to_mask,
+    repair_mesh_t_junctions,
+    triangulate_surface,
+)
 from .osm_occlusion import (
     DEFAULT_OVERPASS_ENDPOINT,
     build_model_occlusion_geometry,
@@ -62,13 +96,23 @@ from .projection import *
 from .projection import _closed_polyline_self_intersects
 from .prefit_semantic_guidance import (
     PrefitSemanticGuidanceConfig,
+    assess_prefit_candidate_visibility,
     build_prefit_semantic_guidance,
     create_prefit_semantic_guidance_overlay,
+)
+from .posttexture_base_repair import level_finished_building_base
+from .opening_rectification import (
+    estimate_opening_aware_rectification,
+    run_opening_sam3_prompts,
 )
 from .quadfit import *
 from .streetview import *
 from .utils import _mask_key, ensure_outdir, name_for, save_sam3_instance_debug_overlay, save_viewer_bundle_npz, save_with_overlay
-from .wireframe_fit import apply_homography as apply_H, make_production_fit_config
+from .wireframe_fit import (
+    apply_homography as apply_H,
+    make_production_fit_config,
+    semantic_boundary_alignment_score,
+)
 
 class _NoopStage:
     def __enter__(self):
@@ -203,9 +247,13 @@ def _build_dgm_camera_elevation_resolver(
 
 def patch_glb_materials_double_sided(glb_path, asset_extras=None) -> bool:
     """
-    Patch exported GLB materials so orbit viewers do not cull back-facing
-    roof/wall/base triangles. Trimesh does not expose this consistently for
-    every generated material type, especially textured walls.
+    Patch exported GLB materials for reliable, matte texture rendering.
+
+    Trimesh does not expose these settings consistently for every generated
+    material type.  Keep structural roof and wall triangles opaque: their PNG
+    alpha is only a texture-generation mask and must not cut holes in the mesh.
+    Restore Trimesh's established photo multiplier, remove metallic reflections,
+    and clamp sampling at texture boundaries.
     """
     try:
         with open(glb_path, "rb") as f:
@@ -258,7 +306,7 @@ def patch_glb_materials_double_sided(glb_path, asset_extras=None) -> bool:
             "pbrMetallicRoughness": {
                 "baseColorFactor": [1.0, 1.0, 1.0, 1.0],
                 "metallicFactor": 0.0,
-                "roughnessFactor": 0.9,
+                "roughnessFactor": 1.0,
             },
         }
 
@@ -269,10 +317,86 @@ def patch_glb_materials_double_sided(glb_path, asset_extras=None) -> bool:
         default_material = 0
         changed = True
 
+    base_color_texture_indices = set()
     for material in materials:
         if material.get("doubleSided") is not True:
             material["doubleSided"] = True
             changed = True
+
+        pbr = material.get("pbrMetallicRoughness")
+        if (
+            material.get("name") == "default_double_sided"
+            and isinstance(pbr, dict)
+        ):
+            if pbr.get("metallicFactor") != 0.0:
+                pbr["metallicFactor"] = 0.0
+                changed = True
+            if pbr.get("roughnessFactor") != 1.0:
+                pbr["roughnessFactor"] = 1.0
+                changed = True
+        if isinstance(pbr, dict) and "baseColorTexture" in pbr:
+            base_color_texture = pbr.get("baseColorTexture")
+            if isinstance(base_color_texture, dict):
+                texture_index = base_color_texture.get("index")
+                if isinstance(texture_index, int) and texture_index >= 0:
+                    base_color_texture_indices.add(texture_index)
+            # Repair files produced by the short-lived MASK + factor-1 patch.
+            # Fresh Trimesh exports already carry the established 0.4 photo
+            # multiplier; otherwise preserve any explicitly authored factor.
+            regressed_photo_material = (
+                pbr.get("baseColorFactor") == [1.0, 1.0, 1.0, 1.0]
+                and material.get("alphaMode") == "MASK"
+                and material.get("alphaCutoff") == 0.5
+            )
+            if regressed_photo_material:
+                pbr["baseColorFactor"] = [0.4, 0.4, 0.4, 1.0]
+                changed = True
+            if pbr.get("metallicFactor") != 0.0:
+                pbr["metallicFactor"] = 0.0
+                changed = True
+            if pbr.get("roughnessFactor") != 1.0:
+                pbr["roughnessFactor"] = 1.0
+                changed = True
+            if material.get("alphaMode") != "OPAQUE":
+                material["alphaMode"] = "OPAQUE"
+                changed = True
+            if "alphaCutoff" in material:
+                del material["alphaCutoff"]
+                changed = True
+
+    textures = gltf.get("textures", [])
+    valid_base_color_texture_indices = {
+        index for index in base_color_texture_indices
+        if index < len(textures)
+    }
+    if valid_base_color_texture_indices:
+        samplers = gltf.setdefault("samplers", [])
+        clamp_sampler = {
+            "magFilter": 9729,   # LINEAR
+            # Avoid averaging distant transparent/black RGB into the facade
+            # edge at lower mip levels.  The exported textures already carry a
+            # finite RGB gutter around their structural UV footprint.
+            "minFilter": 9729,   # LINEAR (no mipmaps)
+            "wrapS": 33071,      # CLAMP_TO_EDGE
+            "wrapT": 33071,
+        }
+        clamp_sampler_index = next(
+            (
+                index for index, sampler in enumerate(samplers)
+                if all(sampler.get(key) == value
+                       for key, value in clamp_sampler.items())
+            ),
+            None,
+        )
+        if clamp_sampler_index is None:
+            samplers.append(clamp_sampler)
+            clamp_sampler_index = len(samplers) - 1
+            changed = True
+        for texture_index in sorted(valid_base_color_texture_indices):
+            texture = textures[texture_index]
+            if texture.get("sampler") != clamp_sampler_index:
+                texture["sampler"] = clamp_sampler_index
+                changed = True
 
     for mesh_def in gltf.get("meshes", []):
         for primitive in mesh_def.get("primitives", []):
@@ -504,7 +628,12 @@ def _write_textured_collada_scene(dae_path, meshes_named, name, texture_dir):
         uv = _mesh_uv_array(mesh)
         if tex_img is not None and uv is not None:
             img_rel = f"textures/texture_{mesh_idx:04d}.png"
-            tex_img.save(texture_dir / f"texture_{mesh_idx:04d}.png")
+            # The mesh geometry defines the structural silhouette.  Strip the
+            # generation-only alpha channel so KMZ viewers cannot infer an
+            # undeclared cutout and punch facade/roof edge holes.
+            tex_img.convert("RGB").save(
+                texture_dir / f"texture_{mesh_idx:04d}.png"
+            )
             image_id = f"{base_id}_image"
             effect_id = f"{base_id}_effect"
             material_id = f"{base_id}_material"
@@ -532,8 +661,8 @@ def _write_textured_collada_scene(dae_path, meshes_named, name, texture_dir):
           <phong>
             <ambient><color>0.350000 0.350000 0.350000 1.000000</color></ambient>
             <diffuse><texture texture="{sampler_id}" texcoord="UVSET0"/></diffuse>
-            <specular><color>0.050000 0.050000 0.050000 1.000000</color></specular>
-            <shininess><float>4.000000</float></shininess>
+            <specular><color>0.000000 0.000000 0.000000 1.000000</color></specular>
+            <shininess><float>0.000000</float></shininess>
           </phong>
         </technique>
       </profile_COMMON>
@@ -589,8 +718,8 @@ def _write_textured_collada_scene(dae_path, meshes_named, name, texture_dir):
           <phong>
             <ambient><color>{_collada_float_list(ambient)}</color></ambient>
             <diffuse><color>{_collada_float_list([r, g, b, a])}</color></diffuse>
-            <specular><color>0.050000 0.050000 0.050000 1.000000</color></specular>
-            <shininess><float>4.000000</float></shininess>
+            <specular><color>0.000000 0.000000 0.000000 1.000000</color></specular>
+            <shininess><float>0.000000</float></shininess>
           </phong>
         </technique>
       </profile_COMMON>
@@ -925,6 +1054,15 @@ _DEBUG_GROUP_COLORS = [
 def _debug_group_color(group_id):
     return _DEBUG_GROUP_COLORS[int(group_id) % len(_DEBUG_GROUP_COLORS)]
 
+def _artifact_topology_id(value):
+    """Return the one stable ID representation used by artifact filenames."""
+    if value is None:
+        return -1
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
 def _collect_facade_group_items(wall_records_by_loop):
     items = []
     group_id = 0
@@ -947,8 +1085,8 @@ def _facade_group_artifact_debug_rows(facade_group_items, geojson_base):
         cid, lid = item.get("loop_key", (-1, -1))
         group_id = int(item.get("group_id", -1))
         wall_indices = [int(r["global_index"]) for r in group_records]
-        cid_tag = int(cid) if cid is not None else -1
-        lid_tag = int(lid) if lid is not None else -1
+        cid_tag = _artifact_topology_id(cid)
+        lid_tag = _artifact_topology_id(lid)
         facade_tag = f"c{cid_tag}_l{lid_tag}_g{group_id:02d}_w{wall_indices[0]:02d}-{wall_indices[-1]:02d}"
         for rec in group_records:
             gi = int(rec["global_index"])
@@ -1720,7 +1858,7 @@ def _fit_ortho_rgba_alpha_inside_polygon(
     max_translation_px=None,
 ):
     """
-    Fit the rectified SAM alpha contour inside the facade outline using a
+    Fit the rectified content-mask contour inside the facade outline using a
     uniform scale + translation, then apply that affine to RGBA. A four-point
     wall is handled as the quad case of the same polygon fitting framework.
     """
@@ -1748,7 +1886,9 @@ def _fit_ortho_rgba_alpha_inside_polygon(
             if source_mask_override is not None:
                 debug_mask = np.asarray(source_mask_override, dtype=bool)
                 if debug_mask.shape == (height, width):
-                    info["source_mask"] = "post_rectification_sam_inside_projection"
+                    info["source_mask"] = (
+                        "reused_prefit_semantic_mask_inside_projection"
+                    )
                 else:
                     debug_mask = ortho_rgba[:, :, 3] > 0
                     info["source_mask"] = "rgba_alpha_shape_fallback"
@@ -1779,7 +1919,7 @@ def _fit_ortho_rgba_alpha_inside_polygon(
         info["source_mask"] = "rgba_alpha"
     else:
         alpha_mask_raw = np.asarray(source_mask_override, dtype=bool)
-        info["source_mask"] = "post_rectification_sam_inside_projection"
+        info["source_mask"] = "reused_prefit_semantic_mask_inside_projection"
         if alpha_mask_raw.shape != (H, W):
             info["reason"] = "source_mask_shape_mismatch"
             return ortho_rgba, None, None, None, info
@@ -1958,7 +2098,7 @@ def _save_ortho_fit_debug_overlay(
     source_mask=None,
     display_mask=None,
 ):
-    """Show selected SAM content and its optional guarded fit in one image."""
+    """Show reused semantic content and its optional guarded fit."""
     def alpha_contour_points(rgba):
         arr = np.asarray(rgba, dtype=np.uint8)
         if arr.ndim != 3 or arr.shape[2] < 4:
@@ -2093,6 +2233,94 @@ def _save_ortho_fit_debug_overlay(
 
     out = Image.alpha_composite(base, overlay)
     out.convert("RGB").save(out_path)
+
+
+def _save_reused_prefit_semantic_overlay(
+    *,
+    img_rgba,
+    wall_poly_px,
+    content_mask,
+    exclusion_mask,
+    out_path,
+    reuse_info=None,
+):
+    """Visualize the persisted full-image SAM3 mask in rectified coordinates."""
+    rgba_array = np.asarray(img_rgba, dtype=np.uint8)
+    if rgba_array.ndim != 3 or rgba_array.shape[2] != 4:
+        raise ValueError("img_rgba must be an HxWx4 array.")
+    height, width = rgba_array.shape[:2]
+    content = np.asarray(content_mask, dtype=bool)
+    exclusion = np.asarray(exclusion_mask, dtype=bool)
+    if content.shape != (height, width) or exclusion.shape != (height, width):
+        raise ValueError("Semantic overlay masks must match img_rgba.")
+
+    # Use an opaque neutral base so transparent/excluded pixels remain easy to
+    # distinguish in the contact sheet.
+    visible_rgba = rgba_array.copy()
+    visible_rgba[:, :, 3] = 255
+    base = Image.fromarray(visible_rgba, mode="RGBA")
+    overlay_array = np.zeros((height, width, 4), dtype=np.uint8)
+    overlay_array[content] = (0, 220, 70, 78)
+    overlay_array[exclusion] = (255, 40, 140, 118)
+    overlay = Image.fromarray(overlay_array, mode="RGBA")
+    composed = Image.alpha_composite(base, overlay)
+
+    draw = ImageDraw.Draw(composed, "RGBA")
+    polygon = [
+        (float(x), float(y))
+        for x, y in np.asarray(wall_poly_px, dtype=np.float64).reshape(-1, 2)
+        if np.isfinite([x, y]).all()
+    ]
+    if len(polygon) >= 3:
+        draw.line(
+            polygon + [polygon[0]],
+            fill=(255, 0, 0, 235),
+            width=2,
+        )
+
+    accepted = bool((reuse_info or {}).get("accepted_for_reuse", False))
+    reason = str((reuse_info or {}).get("reason", "unknown"))
+    lines = [
+        (
+            "reused full-image SAM3 evidence: "
+            f"{'ACCEPTED' if accepted else 'PROJECTION FALLBACK'}"
+        ),
+        "green: retained building content | pink: excluded / LaMa hole",
+        "red: fitted wall projection",
+        "no second SAM3 inference; nearest-neighbor mask propagation",
+    ]
+    roof_removal = dict(
+        (reuse_info or {}).get("post_hough_roof_structure_removal") or {}
+    )
+    if int(roof_removal.get("roof_pixels", 0)) > 0:
+        lines.append(
+            "post-Hough roof removal: "
+            f"{int(roof_removal.get('roof_component_count', 0))} roof(s), "
+            f"{int(roof_removal.get('divider_component_count', 0))} divider(s), "
+            f"{int(roof_removal.get('removed_pixels', 0))} px removed"
+        )
+    if not accepted:
+        lines.append(f"fallback reason: {reason}")
+
+    try:
+        text_boxes = [draw.textbbox((0, 0), line) for line in lines]
+        text_height = max(12, max(box[3] - box[1] for box in text_boxes))
+        text_width = max(box[2] - box[0] for box in text_boxes)
+    except AttributeError:
+        text_width = max(8 * len(line) for line in lines)
+        text_height = 12
+    panel_height = 8 + len(lines) * (text_height + 3)
+    draw.rectangle(
+        (4, 4, min(width - 4, text_width + 16), min(height - 4, panel_height)),
+        fill=(0, 0, 0, 182),
+    )
+    y = 8
+    for line in lines:
+        draw.text((8, y), line, fill=(255, 255, 255, 255))
+        y += text_height + 3
+
+    composed.convert("RGB").save(out_path)
+
 
 def _facade_hough_edge_targets(wall_poly_px):
     poly = np.asarray(wall_poly_px, dtype=np.float64)
@@ -2259,7 +2487,7 @@ def _fit_alpha_boundary_line_for_target(edge_map_u8, target_p0, target_p1, searc
     info["best_overlap_ratio"] = float(overlap_px / max(line_px, 1))
     return selected_line, info
 
-def _apply_group_hough_adjustment(
+def _apply_group_hough_adjustment_legacy(
     ortho_rgba,
     wall_poly_px,
     rect_poly_px,
@@ -2268,11 +2496,14 @@ def _apply_group_hough_adjustment(
     facade_tag,
     edge_mask_override=None,
     allow_guided_warp=True,
+    auxiliary_masks=None,
 ):
     hough_info = {
         "enabled": bool(ENABLE_ORTHO_HOUGH_DEBUG),
-        "method": "rectified_rgb_canny_side_edges_before_sam",
-        "pipeline_stage": "before_post_rectification_sam",
+        "method": "rectified_semantically_filtered_rgb_canny_side_edges",
+        "pipeline_stage": (
+            "after_prefit_mask_rectification_before_optional_ortho_fit"
+        ),
         "total_segments_detected": 0,
         "left_line": None,
         "right_line": None,
@@ -2292,10 +2523,25 @@ def _apply_group_hough_adjustment(
     hough_overlay_path = None
     hough_warp_overlay_path = None
     hough_band_paths = {}
+    transformed_auxiliary_masks = {}
+    for name, value in dict(auxiliary_masks or {}).items():
+        mask = np.asarray(value, dtype=bool)
+        if mask.shape != ortho_rgba.shape[:2]:
+            raise ValueError(
+                f"Hough auxiliary mask {name!r} must match ortho image shape."
+            )
+        transformed_auxiliary_masks[str(name)] = mask.copy()
 
     if wall_poly_px is None or np.asarray(wall_poly_px).shape[0] < 3:
         hough_info["reason"] = "missing_wall_polygon"
-        return ortho_rgba, hough_info, hough_overlay_path, hough_warp_overlay_path, hough_band_paths
+        return (
+            ortho_rgba,
+            hough_info,
+            hough_overlay_path,
+            hough_warp_overlay_path,
+            hough_band_paths,
+            transformed_auxiliary_masks,
+        )
 
     wall_poly_px = np.asarray(wall_poly_px, dtype=np.float64)
     wall_mask_bool = build_wall_region_mask(
@@ -2305,19 +2551,19 @@ def _apply_group_hough_adjustment(
     ) > 0
     texture_alpha_mask = ortho_rgba[:, :, 3] > 0
     alpha_mask = texture_alpha_mask & wall_mask_bool
-    edge_source = "rectified_rgb_content_edges_before_sam"
+    edge_source = "rectified_reused_semantic_content_edges"
     if edge_mask_override is not None:
         candidate_edge_mask = np.asarray(edge_mask_override, dtype=bool)
         if candidate_edge_mask.shape == texture_alpha_mask.shape and candidate_edge_mask.any():
             alpha_mask = candidate_edge_mask & wall_mask_bool
-            edge_source = "bounded_post_rectification_sam_boundary"
+            edge_source = "explicit_reused_semantic_mask_boundary"
             hough_info["method"] = "bounded_mask_boundary_houghlinesp"
             hough_info["pipeline_stage"] = "explicit_mask_override"
     ortho_rgba = ortho_rgba.copy()
     ortho_rgba[:, :, 3] = (texture_alpha_mask.astype(np.uint8) * 255)
     ortho_before_hough = ortho_rgba.copy()
 
-    if edge_source == "rectified_rgb_content_edges_before_sam":
+    if edge_source == "rectified_reused_semantic_content_edges":
         hough_edge_map_u8 = build_edge_map_for_hough(
             ortho_rgba[:, :, :3],
             alpha_mask,
@@ -2474,6 +2720,33 @@ def _apply_group_hough_adjustment(
                     proj_right_line=proj_right_line,
                     proj_top_line=None,
                 )
+                for mask_name, mask_value in list(
+                    transformed_auxiliary_masks.items()
+                ):
+                    transformed_auxiliary_masks[mask_name] = (
+                        apply_hough_guided_ortho_warp(
+                            ortho_rgba=mask_value.astype(np.uint8) * 255,
+                            sel_left_line=(
+                                np.asarray(
+                                    left_edge["selected_line"],
+                                    dtype=np.float64,
+                                )
+                                if left_edge is not None else None
+                            ),
+                            sel_right_line=(
+                                np.asarray(
+                                    right_edge["selected_line"],
+                                    dtype=np.float64,
+                                )
+                                if right_edge is not None else None
+                            ),
+                            sel_top_line=None,
+                            proj_left_line=proj_left_line,
+                            proj_right_line=proj_right_line,
+                            proj_top_line=None,
+                            interpolation=cv2.INTER_NEAREST,
+                        ) > 0
+                    )
                 hough_info["guided_warp_applied"] = True
                 hough_info["guided_warp_axes"] = [
                     f"{side}_edge_{int(edge['edge_index']):02d}"
@@ -2534,6 +2807,8 @@ def _apply_group_hough_adjustment(
         hough_info["clipped_to_wall_projection_after_warp"] = True
         ortho_rgba[~wall_mask_bool, :3] = 0
         ortho_rgba[~wall_mask_bool, 3] = 0
+        for mask_name in list(transformed_auxiliary_masks):
+            transformed_auxiliary_masks[mask_name] &= wall_mask_bool
 
         if HOUGH_SAVE_BAND_MASKS:
             for band_name, band_u8 in band_specs.items():
@@ -2590,7 +2865,955 @@ def _apply_group_hough_adjustment(
         "right_info": hough_right_info,
         "top_info": hough_top_info,
     })
-    return ortho_rgba, hough_info, hough_overlay_path, hough_warp_overlay_path, hough_band_paths
+    return (
+        ortho_rgba,
+        hough_info,
+        hough_overlay_path,
+        hough_warp_overlay_path,
+        hough_band_paths,
+        transformed_auxiliary_masks,
+    )
+
+
+def _save_opening_aware_rectification_overlay(
+    rgba,
+    wall_polygon,
+    opening_info,
+    out_path,
+):
+    """Draw corrected observed quads and their axis-aligned fitted targets."""
+    image = Image.fromarray(np.asarray(rgba, dtype=np.uint8), mode="RGBA")
+    white = Image.new("RGBA", image.size, (255, 255, 255, 255))
+    bgr = cv2.cvtColor(
+        np.asarray(Image.alpha_composite(white, image).convert("RGB")),
+        cv2.COLOR_RGB2BGR,
+    )
+    polygon = np.rint(np.asarray(wall_polygon)).astype(np.int32)
+    if len(polygon) >= 3:
+        cv2.polylines(bgr, [polygon], True, (0, 0, 255), 2)
+    homography = np.asarray(
+        opening_info.get("homography", np.eye(3)), dtype=np.float64
+    )
+    drawn = 0
+    for row in opening_info.get("openings", []):
+        quad = np.asarray(
+            row.get("quad_xy_tl_tr_br_bl", []), dtype=np.float64
+        )
+        if quad.shape != (4, 2):
+            continue
+        try:
+            corrected = apply_H(quad, homography)
+        except ValueError:
+            continue
+        left = float(np.mean(corrected[[0, 3], 0]))
+        right = float(np.mean(corrected[[1, 2], 0]))
+        top = float(np.mean(corrected[[0, 1], 1]))
+        bottom = float(np.mean(corrected[[2, 3], 1]))
+        fitted = np.asarray(
+            [[left, top], [right, top], [right, bottom], [left, bottom]],
+            dtype=np.float64,
+        )
+        cv2.polylines(
+            bgr,
+            [np.rint(corrected).astype(np.int32)],
+            True,
+            (0, 220, 220),
+            1,
+        )
+        cv2.polylines(
+            bgr,
+            [np.rint(fitted).astype(np.int32)],
+            True,
+            (0, 190, 0),
+            2,
+        )
+        drawn += 1
+    cv2.rectangle(bgr, (5, 5), (560, 55), (35, 35, 35), -1)
+    cv2.putText(
+        bgr,
+        f"opening-aware: {drawn} accepted | yellow observed | green fitted",
+        (14, 35),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.imwrite(str(out_path), bgr)
+
+
+def _validated_side_extension_corridor(
+    image_shape_hw,
+    target_line,
+    selected_line,
+    candidate_extension_mask,
+):
+    """Keep only semantic content between one projected and observed side."""
+    height, width = [int(value) for value in image_shape_hw]
+    candidate = np.asarray(candidate_extension_mask, dtype=bool)
+    if candidate.shape != (height, width) or not candidate.any():
+        return np.zeros((height, width), dtype=bool)
+    target = np.asarray(target_line, dtype=np.float64).reshape(2, 2)
+    selected = np.asarray(selected_line, dtype=np.float64).reshape(2, 2)
+    direction = selected[1] - selected[0]
+    direction /= max(float(np.linalg.norm(direction)), 1.0e-9)
+    projected = []
+    for point in target:
+        along = float(np.dot(point - selected[0], direction))
+        projected.append(selected[0] + along * direction)
+    hull = cv2.convexHull(
+        np.rint(np.vstack([target, np.asarray(projected)])).astype(np.int32)
+    )
+    corridor = np.zeros((height, width), dtype=np.uint8)
+    if len(hull) >= 3:
+        cv2.fillConvexPoly(corridor, hull, 1, lineType=cv2.LINE_8)
+        corridor = cv2.dilate(
+            corridor,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            iterations=1,
+        )
+    return candidate & (corridor > 0)
+
+
+def _mask_rgba_to_semantic_content(rgba, content_mask):
+    """Make the accepted semantic mask authoritative before resampling."""
+    output = np.asarray(rgba, dtype=np.uint8).copy()
+    keep = np.asarray(content_mask, dtype=bool)
+    if keep.shape != output.shape[:2]:
+        raise ValueError("Semantic content mask must match the RGBA image.")
+    output[~keep, :3] = 0
+    output[:, :, 3] = keep.astype(np.uint8) * 255
+    return output
+
+
+def _apply_group_hough_adjustment(
+    ortho_rgba,
+    wall_poly_px,
+    rect_poly_px,
+    per_building_out,
+    geojson_base,
+    facade_tag,
+    edge_mask_override=None,
+    allow_guided_warp=True,
+    auxiliary_masks=None,
+    side_evidence=None,
+    opening_context=None,
+):
+    """Validate side evidence, then prefer one shared opening-aware warp."""
+    del rect_poly_px  # Roof/base rectangle edges are not alignment evidence.
+    rgba = np.asarray(ortho_rgba, dtype=np.uint8).copy()
+    height, width = rgba.shape[:2]
+    wall_poly = np.asarray(wall_poly_px, dtype=np.float64)
+    transformed_masks = {}
+    for name, value in dict(auxiliary_masks or {}).items():
+        mask = np.asarray(value, dtype=bool)
+        if mask.shape != (height, width):
+            raise ValueError(
+                f"Hough auxiliary mask {name!r} must match ortho image shape."
+            )
+        transformed_masks[str(name)] = mask.copy()
+
+    hough_stage_enabled = bool(ENABLE_ORTHO_HOUGH_DEBUG)
+    opening_stage_enabled = bool(globals().get(
+        "ENABLE_OPENING_AWARE_RECTIFICATION", True,
+    ))
+    info = {
+        "enabled": hough_stage_enabled,
+        "method": "side_specific_semantic_first_validated_hough",
+        "pipeline_stage": "pre_clip_joint_side_and_opening_rectification",
+        "total_segments_detected": 0,
+        "left_line": None,
+        "right_line": None,
+        "top_line": None,
+        "selected_edges": [],
+        "left_info": {},
+        "right_info": {},
+        "top_info": {},
+        "guided_warp_enabled": bool(
+            ENABLE_HOUGH_GUIDED_WARP and allow_guided_warp
+        ),
+        "single_side_warp_enabled": bool(globals().get(
+            "ENABLE_HOUGH_SINGLE_SIDE_WARP", True,
+        )),
+        "guided_warp_applied": False,
+        "guided_warp_axes": [],
+        "accepted_side_extension_pixels": 0,
+        "accepted_side_extension_sides": [],
+        "opening_aware": {
+            "enabled": opening_stage_enabled,
+            "applied": False,
+            "reason": "not_run",
+        },
+        "side_evidence": side_evidence_metadata(side_evidence or {}),
+    }
+    hough_overlay_path = None
+    hough_warp_overlay_path = None
+    hough_band_paths = {}
+    if wall_poly.ndim != 2 or wall_poly.shape[0] < 3:
+        info["reason"] = "missing_wall_polygon"
+        return (
+            rgba, info, hough_overlay_path, hough_warp_overlay_path,
+            hough_band_paths, transformed_masks,
+        )
+
+    wall_mask = build_wall_region_mask(height, width, wall_poly) > 0
+    texture_mask = rgba[:, :, 3] > 0
+    before = rgba.copy()
+    if edge_mask_override is not None:
+        explicit = np.asarray(edge_mask_override, dtype=bool)
+        if explicit.shape != (height, width):
+            raise ValueError("Explicit Hough edge mask must match ortho image.")
+        rgb_edges = build_alpha_boundary_edge_map_for_hough(explicit)
+        info["edge_source"] = "explicit_boundary_override"
+    else:
+        rgb_edges = build_edge_map_for_hough(rgba[:, :, :3], texture_mask)
+        # Suppress only the synthetic projected polygon boundary.  The old
+        # implementation erased the complete semantic/alpha outline, including
+        # the true wall-to-sky edge requested as the preferred cue.
+        projected_boundary = build_alpha_boundary_edge_map_for_hough(wall_mask)
+        rgb_edges[projected_boundary > 0] = 0
+        info["edge_source"] = "rgb_canny_with_projection_boundary_suppressed"
+
+    side_rows = dict((side_evidence or {}).get("sides") or {})
+    preferred_union = np.zeros((height, width), dtype=bool)
+    for row in side_rows.values():
+        for key in ("preferred_inside_mask", "preferred_outside_mask"):
+            mask = np.asarray(
+                row.get(key, np.zeros((height, width), dtype=bool)),
+                dtype=bool,
+            )
+            if mask.shape == (height, width):
+                preferred_union |= mask
+    rgb_edges[preferred_union] = 255
+
+    all_lines = []
+    selected_edges = []
+    band_specs = {}
+    edge_targets = _facade_hough_edge_targets(wall_poly)
+    all_side_targets = _facade_hough_side_edge_targets(edge_targets)
+    side_targets = all_side_targets if hough_stage_enabled else []
+    info.update({
+        "target_edge_count": int(len(edge_targets)),
+        "candidate_mode": "left_right_independent_inside_then_outside",
+        "side_target_edge_indices": [
+            int(edge["edge_index"]) for edge in all_side_targets
+        ],
+        "skipped_bottom_edge_indices": [
+            int(edge["edge_index"])
+            for edge in edge_targets if bool(edge.get("is_bottom"))
+        ],
+    })
+    if not hough_stage_enabled:
+        info["hough_detection_reason"] = "disabled_by_configuration"
+
+    for edge in side_targets:
+        side = str(edge.get("side"))
+        target_p0 = np.asarray(edge["target_p0"], dtype=np.float64)
+        target_p1 = np.asarray(edge["target_p1"], dtype=np.float64)
+        side_row = dict(side_rows.get(side) or {})
+        default_band = build_line_search_band(
+            height, width, target_p0, target_p1, wall_mask,
+            int(HOUGH_SEARCH_BAND_PX),
+        ) > 0
+        attempts = []
+        if bool(side_row.get("major_foreground_occlusion", False)):
+            attempts = []
+            edge_info = {
+                "rejection_reason": "major_foreground_occlusion_preserve_current_crop",
+                "foreground_occlusion_fraction": float(
+                    side_row.get("foreground_occlusion_fraction", 0.0)
+                ),
+                "attempts": [],
+            }
+            selected_line = None
+            selected_attempt = None
+        else:
+            if side_row:
+                attempt_specs = [
+                    ("inside_semantic", "inside_search_mask", "preferred_inside_mask", True),
+                    ("inside_rgb", "inside_search_mask", None, True),
+                    ("outside_semantic", "outside_search_mask", "preferred_outside_mask", True),
+                    (
+                        "outside_rgb", "outside_search_mask", None,
+                        bool(side_row.get("outside_rgb_allowed", False)),
+                    ),
+                ]
+            else:
+                attempt_specs = [("legacy_band_rgb", None, None, True)]
+            selected_line = None
+            selected_attempt = None
+            edge_info = {"attempts": []}
+            for attempt_name, band_key, preferred_key, enabled in attempt_specs:
+                if not enabled:
+                    continue
+                band = default_band if band_key is None else np.asarray(
+                    side_row.get(
+                        band_key, np.zeros((height, width), dtype=bool)
+                    ),
+                    dtype=bool,
+                )
+                if band.shape != (height, width) or not band.any():
+                    edge_info["attempts"].append({
+                        "name": attempt_name,
+                        "accepted": False,
+                        "reason": "empty_search_region",
+                    })
+                    continue
+                preferred = None
+                if preferred_key is not None:
+                    preferred = np.asarray(
+                        side_row.get(
+                            preferred_key,
+                            np.zeros((height, width), dtype=bool),
+                        ),
+                        dtype=bool,
+                    )
+                    if preferred.shape != (height, width) or not preferred.any():
+                        edge_info["attempts"].append({
+                            "name": attempt_name,
+                            "accepted": False,
+                            "reason": "no_semantic_interface_in_search_region",
+                        })
+                        continue
+                    attempt_edges = preferred.astype(np.uint8) * 255
+                else:
+                    attempt_edges = rgb_edges
+                lines = detect_hough_segments(
+                    attempt_edges, roi_mask=band.astype(np.uint8) * 255
+                )
+                all_lines.extend(lines)
+                maximum_side_distance_px = min(
+                    float(globals().get(
+                        "HOUGH_SIDE_MAX_DISTANCE_PX", 36.0,
+                    )),
+                    max(
+                        6.0,
+                        float(edge["length_px"])
+                        * float(globals().get(
+                            "HOUGH_SIDE_MAX_DISTANCE_TARGET_RATIO", 0.04,
+                        )),
+                    ),
+                )
+                candidate, candidate_info = select_best_hough_line_for_target(
+                    lines,
+                    target_p0,
+                    target_p1,
+                    band.astype(np.uint8),
+                    attempt_edges,
+                    min_length_px=float(HOUGH_MIN_LENGTH_PX),
+                    angle_thresh_deg=float(globals().get(
+                        "HOUGH_SIDE_ANGLE_THRESH_DEG", 8.0,
+                    )),
+                    minimum_target_coverage_ratio=float(globals().get(
+                        "HOUGH_SIDE_MIN_TARGET_COVERAGE_RATIO", 0.75,
+                    )),
+                    maximum_length_ratio=float(globals().get(
+                        "HOUGH_SIDE_MAX_LENGTH_RATIO", 1.20,
+                    )),
+                    maximum_distance_px=maximum_side_distance_px,
+                    minimum_band_occupancy_ratio=float(globals().get(
+                        "HOUGH_SIDE_MIN_BAND_OCCUPANCY_RATIO", 0.80,
+                    )),
+                    minimum_edge_support_ratio=float(globals().get(
+                        (
+                            "FACADE_SIDE_MIN_SEMANTIC_INTERFACE_SUPPORT"
+                            if preferred is not None
+                            else "HOUGH_SIDE_MIN_EDGE_SUPPORT_RATIO"
+                        ),
+                        0.20 if preferred is not None else 0.30,
+                    )),
+                    offset_cluster_px=float(globals().get(
+                        "HOUGH_SIDE_OFFSET_CLUSTER_PX", 12.0,
+                    )),
+                    preferred_edge_map_u8=(
+                        preferred.astype(np.uint8) * 255
+                        if preferred is not None else None
+                    ),
+                )
+                attempt_record = {
+                    "name": attempt_name,
+                    "accepted": candidate is not None,
+                    "segment_count": int(len(lines)),
+                    "info": candidate_info,
+                }
+                edge_info["attempts"].append(attempt_record)
+                band_specs[f"{side}_{attempt_name}"] = band.astype(np.uint8)
+                if candidate is not None:
+                    selected_line = candidate
+                    selected_attempt = attempt_name
+                    edge_info.update(candidate_info)
+                    edge_info["selected_attempt"] = attempt_name
+                    edge_info["selection_source"] = (
+                        "semantic_interface_hough"
+                        if preferred is not None else "rgb_canny_hough"
+                    )
+                    break
+            if selected_line is None:
+                edge_info["rejection_reason"] = (
+                    "no_inside_or_permitted_outside_candidate_passed_all_hard_gates"
+                )
+
+        if selected_attempt == "inside_semantic":
+            side_decision = "inside_edge_preferred_semantic"
+        elif selected_attempt == "inside_rgb":
+            side_decision = "inside_edge_rgb"
+        elif selected_attempt == "outside_semantic":
+            side_decision = (
+                "outside_adjacent_edge_semantic"
+                if bool(side_row.get("adjacent_visible", False))
+                else "background_interface_semantic"
+            )
+        elif selected_attempt == "outside_rgb":
+            side_decision = "outside_adjacent_edge_rgb"
+        elif bool(side_row.get("major_foreground_occlusion", False)):
+            side_decision = "keep_current_occlusion"
+        else:
+            side_decision = "no_safe_edge"
+        edge_info["side_decision"] = side_decision
+        edge_record = {
+            "edge_index": int(edge["edge_index"]),
+            "target_p0": target_p0,
+            "target_p1": target_p1,
+            "target_length_px": float(edge["length_px"]),
+            "target_angle_deg": float(edge["angle_deg"]),
+            "is_bottom": False,
+            "side": side,
+            "selected_line": selected_line,
+            "info": edge_info,
+        }
+        selected_edges.append(edge_record)
+        if side == "left":
+            info["left_info"] = edge_info
+        elif side == "right":
+            info["right_info"] = edge_info
+
+    opening_context = dict(opening_context or {})
+    rectified_side_extensions = {}
+    source_side_extensions = {}
+    source_extension_rows = dict(
+        opening_context.get("source_side_extensions") or {}
+    )
+    source_to_rectified_h = opening_context.get("source_to_rectified_h")
+    inverse_source_h = None
+    if source_to_rectified_h is not None:
+        try:
+            inverse_source_h = np.linalg.inv(
+                np.asarray(source_to_rectified_h, dtype=np.float64)
+            )
+        except np.linalg.LinAlgError:
+            inverse_source_h = None
+    for edge in selected_edges:
+        side = str(edge.get("side"))
+        attempt = str((edge.get("info") or {}).get("selected_attempt", ""))
+        if (
+            edge.get("selected_line") is None
+            or not attempt.startswith("outside_")
+        ):
+            continue
+        row = dict(side_rows.get(side) or {})
+        rectified_candidate = np.asarray(
+            row.get(
+                "candidate_extension_mask",
+                np.zeros((height, width), dtype=bool),
+            ),
+            dtype=bool,
+        )
+        accepted_rectified = _validated_side_extension_corridor(
+            (height, width),
+            np.vstack([edge["target_p0"], edge["target_p1"]]),
+            edge["selected_line"],
+            rectified_candidate,
+        )
+        rectified_side_extensions[side] = accepted_rectified
+        source_candidate = source_extension_rows.get(side)
+        if source_candidate is not None and inverse_source_h is not None:
+            source_candidate = np.asarray(source_candidate, dtype=bool)
+            source_height, source_width = source_candidate.shape
+            source_corridor = cv2.warpPerspective(
+                accepted_rectified.astype(np.uint8),
+                inverse_source_h,
+                (source_width, source_height),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            ) > 0
+            source_side_extensions[side] = source_candidate & source_corridor
+
+    info["total_segments_detected"] = int(len(all_lines))
+    info["hough_mask_area_px"] = int(texture_mask.sum())
+    info["validated_outside_extension_candidates"] = {
+        side: int(mask.sum())
+        for side, mask in rectified_side_extensions.items()
+    }
+    opening_authoritative = False
+    opening_applied = False
+    if (
+        opening_stage_enabled
+        and opening_context.get("source_rows") is not None
+    ):
+        opening_authoritative = bool(
+            len(opening_context.get("source_rows", [])) > 0
+        )
+        try:
+            residual_h, opening_info, _observations = (
+                estimate_opening_aware_rectification(
+                    opening_context.get("source_rows", []),
+                    np.asarray(
+                        opening_context["source_wall_mask"], dtype=bool
+                    ),
+                    np.asarray(
+                        opening_context["source_to_rectified_h"],
+                        dtype=np.float64,
+                    ),
+                    (height, width),
+                    wall_mask,
+                    wall_poly,
+                    selected_edges,
+                    source_exclusion_mask=(
+                        None
+                        if opening_context.get("source_exclusion_mask") is None
+                        else np.asarray(
+                            opening_context["source_exclusion_mask"],
+                            dtype=bool,
+                        )
+                    ),
+                    minimum_sam_score=float(globals().get(
+                        "OPENING_AWARE_MIN_SAM_SCORE", 0.25,
+                    )),
+                    minimum_stability=float(globals().get(
+                        "OPENING_AWARE_MIN_STABILITY", 0.78,
+                    )),
+                    minimum_openings=int(globals().get(
+                        "OPENING_AWARE_MIN_OPENINGS", 3,
+                    )),
+                    maximum_side_consensus_deg=float(globals().get(
+                        "OPENING_AWARE_MAX_CONSENSUS_DEG", 5.0,
+                    )),
+                    allow_projective=bool(globals().get(
+                        "OPENING_AWARE_ALLOW_PROJECTIVE", True,
+                    )),
+                    maximum_final_side_angle_deg=float(globals().get(
+                        "OPENING_AWARE_MAX_FINAL_SIDE_ANGLE_DEG", 2.0,
+                    )),
+                    maximum_final_side_distance_px=float(globals().get(
+                        "OPENING_AWARE_MAX_FINAL_SIDE_DISTANCE_PX", 8.0,
+                    )),
+                    maximum_final_opening_p90_axis_error_deg=float(
+                        globals().get(
+                            "OPENING_AWARE_MAX_FINAL_P90_AXIS_ERROR_DEG",
+                            3.0,
+                        )
+                    ),
+                    maximum_final_opening_p90_orthogonality_error_deg=float(
+                        globals().get(
+                            "OPENING_AWARE_MAX_FINAL_P90_ORTHOGONALITY_ERROR_DEG",
+                            5.0,
+                        )
+                    ),
+                    maximum_final_per_opening_axis_error_deg=float(
+                        globals().get(
+                            "OPENING_AWARE_MAX_FINAL_PER_OPENING_AXIS_ERROR_DEG",
+                            4.0,
+                        )
+                    ),
+                    maximum_final_per_opening_orthogonality_error_deg=float(
+                        globals().get(
+                            "OPENING_AWARE_MAX_FINAL_PER_OPENING_ORTHOGONALITY_ERROR_DEG",
+                            5.0,
+                        )
+                    ),
+                )
+            )
+            info["opening_aware"] = opening_info
+            for constraint_row in opening_info.get("side_constraints", []):
+                if constraint_row.get("rejection_reason") != (
+                    "conflicts_with_opening_consensus"
+                ):
+                    continue
+                conflict_side = str(constraint_row.get("side"))
+                for selected_edge in selected_edges:
+                    if str(selected_edge.get("side")) != conflict_side:
+                        continue
+                    selected_edge["selected_line"] = None
+                    selected_edge_info = selected_edge.setdefault(
+                        "info", {}
+                    )
+                    selected_edge_info[
+                        "opening_consensus_veto"
+                    ] = True
+                    selected_edge_info[
+                        "rejection_reason"
+                    ] = "conflicts_with_opening_consensus"
+            opening_authoritative = bool(
+                int(opening_info.get("accepted_opening_count", 0))
+                >= int(globals().get("OPENING_AWARE_MIN_OPENINGS", 3))
+            )
+            opening_applied = bool(opening_info.get("applied", False))
+            if opening_applied:
+                admitted_sides = {
+                    str(row.get("side"))
+                    for row in opening_info.get("side_constraints", [])
+                    if bool(row.get("admitted", False))
+                }
+                source_rgba = opening_context.get("source_rgba")
+                source_masks = {
+                    str(name): np.asarray(mask, dtype=bool).copy()
+                    for name, mask in dict(
+                        opening_context.get("source_masks") or {}
+                    ).items()
+                }
+                accepted_source_extension = np.zeros(
+                    np.asarray(source_rgba).shape[:2]
+                    if source_rgba is not None
+                    else (1, 1),
+                    dtype=bool,
+                )
+                for side in admitted_sides:
+                    extension = source_side_extensions.get(side)
+                    if (
+                        extension is not None
+                        and extension.shape == accepted_source_extension.shape
+                    ):
+                        accepted_source_extension |= extension
+                for mask_name in ("semantic_content", "semantic_candidate"):
+                    if (
+                        mask_name in source_masks
+                        and source_masks[mask_name].shape
+                        == accepted_source_extension.shape
+                    ):
+                        source_masks[mask_name] |= accepted_source_extension
+                if source_rgba is not None and source_masks:
+                    total_h = residual_h @ np.asarray(
+                        opening_context["source_to_rectified_h"],
+                        dtype=np.float64,
+                    )
+                    render_source_rgba = np.asarray(
+                        source_rgba, dtype=np.uint8
+                    )
+                    if "semantic_content" in source_masks:
+                        # Candidate outside-wall pixels were available for line
+                        # detection, but only a validated side corridor may be
+                        # sampled into the final texture.
+                        render_source_rgba = _mask_rgba_to_semantic_content(
+                            render_source_rgba,
+                            source_masks["semantic_content"],
+                        )
+                    rgba = cv2.warpPerspective(
+                        render_source_rgba,
+                        total_h,
+                        (width, height),
+                        flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=(0, 0, 0, 0),
+                    )
+                    for mask_name, source_mask in source_masks.items():
+                        transformed_masks[str(mask_name)] = cv2.warpPerspective(
+                            np.asarray(source_mask, dtype=np.uint8),
+                            total_h,
+                            (width, height),
+                            flags=cv2.INTER_NEAREST,
+                            borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=0,
+                        ) > 0
+                    info["opening_aware"]["rendering"] = {
+                        "method": "one_pass_from_source",
+                        "H_source_to_final_rectified": total_h.tolist(),
+                        "rgb_interpolation": "linear",
+                        "mask_interpolation": "nearest",
+                    }
+                else:
+                    accepted_rectified_extension = np.zeros(
+                        (height, width), dtype=bool
+                    )
+                    for side in admitted_sides:
+                        accepted_rectified_extension |= rectified_side_extensions.get(
+                            side, np.zeros((height, width), dtype=bool)
+                        )
+                    for mask_name in ("semantic_content", "semantic_candidate"):
+                        if mask_name in transformed_masks:
+                            transformed_masks[mask_name] |= (
+                                accepted_rectified_extension
+                            )
+                    if "semantic_content" in transformed_masks:
+                        rgba = _mask_rgba_to_semantic_content(
+                            rgba, transformed_masks["semantic_content"]
+                        )
+                    rgba = cv2.warpPerspective(
+                        rgba,
+                        residual_h,
+                        (width, height),
+                        flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=(0, 0, 0, 0),
+                    )
+                    for mask_name, mask in list(transformed_masks.items()):
+                        transformed_masks[mask_name] = cv2.warpPerspective(
+                            mask.astype(np.uint8),
+                            residual_h,
+                            (width, height),
+                            flags=cv2.INTER_NEAREST,
+                            borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=0,
+                        ) > 0
+                info["guided_warp_applied"] = True
+                info["accepted_side_extension_pixels"] = int(
+                    accepted_source_extension.sum()
+                    if source_rgba is not None
+                    else accepted_rectified_extension.sum()
+                )
+                info["accepted_side_extension_sides"] = sorted(
+                    admitted_sides
+                )
+                info["guided_warp_axes"] = [
+                    "opening_vertical_family",
+                    "opening_horizontal_family",
+                ] + [
+                    f"{row['side']}_validated_side"
+                    for row in opening_info.get("side_constraints", [])
+                    if bool(row.get("admitted", False))
+                ]
+                info["side_horizontal_warp"] = {
+                    "applied": False,
+                    "reason": "replaced_by_shared_opening_aware_homography",
+                }
+        except Exception as opening_exc:
+            info["opening_aware"] = {
+                "enabled": True,
+                "applied": False,
+                "reason": f"opening_solver_failed: {opening_exc}",
+            }
+            print(f"[{facade_tag}] opening-aware rectification failed: {opening_exc}")
+
+    if (
+        not opening_applied
+        and not opening_authoritative
+        and hough_stage_enabled
+        and ENABLE_HOUGH_GUIDED_WARP
+        and allow_guided_warp
+    ):
+        target_by_side = {
+            edge["side"]: edge for edge in selected_edges
+            if edge.get("side") in {"left", "right"}
+        }
+        selected_by_side = {
+            side: edge for side, edge in target_by_side.items()
+            if edge.get("selected_line") is not None
+        }
+        left_target = target_by_side.get("left")
+        right_target = target_by_side.get("right")
+        left_edge = selected_by_side.get("left")
+        right_edge = selected_by_side.get("right")
+        count = int(left_edge is not None) + int(right_edge is not None)
+        single_allowed = bool(globals().get(
+            "ENABLE_HOUGH_SINGLE_SIDE_WARP", True,
+        ))
+        can_warp = bool(
+            left_target is not None
+            and right_target is not None
+            and (count == 2 or (single_allowed and count == 1))
+        )
+        if can_warp:
+            accepted_rectified_extension = np.zeros(
+                (height, width), dtype=bool
+            )
+            accepted_extension_sides = []
+            for side, selected_edge in (
+                ("left", left_edge), ("right", right_edge)
+            ):
+                if selected_edge is None:
+                    continue
+                extension = rectified_side_extensions.get(side)
+                if extension is not None:
+                    accepted_rectified_extension |= extension
+                    if extension.any():
+                        accepted_extension_sides.append(side)
+            for mask_name in ("semantic_content", "semantic_candidate"):
+                if mask_name in transformed_masks:
+                    transformed_masks[mask_name] |= (
+                        accepted_rectified_extension
+                    )
+            if "semantic_content" in transformed_masks:
+                rgba = _mask_rgba_to_semantic_content(
+                    rgba, transformed_masks["semantic_content"]
+                )
+            projected_left = np.vstack([
+                left_target["target_p0"], left_target["target_p1"]
+            ])
+            projected_right = np.vstack([
+                right_target["target_p0"], right_target["target_p1"]
+            ])
+            selected_left = (
+                None if left_edge is None else left_edge["selected_line"]
+            )
+            selected_right = (
+                None if right_edge is None else right_edge["selected_line"]
+            )
+            rgba = apply_hough_guided_ortho_warp(
+                rgba,
+                selected_left,
+                selected_right,
+                None,
+                projected_left,
+                projected_right,
+                None,
+            )
+            for mask_name, mask in list(transformed_masks.items()):
+                transformed_masks[mask_name] = apply_hough_guided_ortho_warp(
+                    mask.astype(np.uint8),
+                    selected_left,
+                    selected_right,
+                    None,
+                    projected_left,
+                    projected_right,
+                    None,
+                    interpolation=cv2.INTER_NEAREST,
+                ) > 0
+            info["guided_warp_applied"] = True
+            info["accepted_side_extension_pixels"] = int(
+                accepted_rectified_extension.sum()
+            )
+            info["accepted_side_extension_sides"] = sorted(
+                accepted_extension_sides
+            )
+            info["guided_warp_axes"] = [
+                f"{side}_edge_{int(edge['edge_index']):02d}"
+                for side, edge in (("left", left_edge), ("right", right_edge))
+                if edge is not None
+            ]
+            info["side_horizontal_warp"] = {
+                "applied": True,
+                "method": (
+                    "validated_two_side_piecewise_horizontal"
+                    if count == 2
+                    else "validated_single_side_piecewise_with_identity_anchor"
+                ),
+            }
+        else:
+            info["side_horizontal_warp"] = {
+                "applied": False,
+                "reason": "no_validated_side_configuration",
+            }
+    elif opening_authoritative and not opening_applied:
+        info["side_horizontal_warp"] = {
+            "applied": False,
+            "reason": "reliable_openings_present_identity_fallback_blocks_legacy_side_warp",
+        }
+
+    if "semantic_content" in transformed_masks:
+        final_content = np.asarray(
+            transformed_masks["semantic_content"], dtype=bool
+        )
+        if final_content.shape == (height, width):
+            info["nonaccepted_candidate_pixels_removed"] = int(
+                ((rgba[:, :, 3] > 0) & (~final_content)).sum()
+            )
+            rgba = _mask_rgba_to_semantic_content(rgba, final_content)
+
+    outside = (rgba[:, :, 3] > 0) & (~wall_mask)
+    info["outside_wall_pixels_removed_after_warp"] = int(outside.sum())
+    info["clipped_to_wall_projection_after_warp"] = True
+    rgba[~wall_mask, :3] = 0
+    rgba[~wall_mask, 3] = 0
+    for mask_name in list(transformed_masks):
+        transformed_masks[mask_name] &= wall_mask
+
+    selected_by_side = {
+        edge.get("side"): edge for edge in selected_edges
+        if edge.get("selected_line") is not None
+    }
+    left_line = (
+        None
+        if selected_by_side.get("left") is None
+        else np.asarray(selected_by_side["left"]["selected_line"])
+    )
+    right_line = (
+        None
+        if selected_by_side.get("right") is None
+        else np.asarray(selected_by_side["right"]["selected_line"])
+    )
+    hough_overlay_path = Path(
+        per_building_out,
+        f"{geojson_base}__{facade_tag}__hough_overlay.png",
+    )
+    save_hough_all_lines_overlay(
+        img_pil=Image.fromarray(before).convert("RGBA"),
+        wall_quad_xy=wall_poly,
+        all_lines=all_lines,
+        selected_left=left_line,
+        selected_right=right_line,
+        selected_top=None,
+        out_path=str(hough_overlay_path),
+        selected_edges=selected_edges,
+    )
+    if (
+        bool(globals().get("SAVE_OPENING_AWARE_DEBUG", True))
+        and (info.get("opening_aware") or {}).get("openings")
+    ):
+        opening_overlay_path = Path(
+            per_building_out,
+            f"{geojson_base}__{facade_tag}__opening_aware_overlay.png",
+        )
+        _save_opening_aware_rectification_overlay(
+            rgba,
+            wall_poly,
+            info["opening_aware"],
+            opening_overlay_path,
+        )
+        info["opening_aware"]["overlay_png"] = (
+            opening_overlay_path.name
+        )
+    if (
+        info["guided_warp_applied"]
+        and SAVE_HOUGH_WARP_DEBUG
+        and allow_guided_warp
+    ):
+        hough_warp_overlay_path = Path(
+            per_building_out,
+            f"{geojson_base}__{facade_tag}__hough_warp_overlay.png",
+        )
+        save_hough_warp_overlay(
+            Image.fromarray(rgba).convert("RGBA"),
+            wall_poly,
+            str(hough_warp_overlay_path),
+        )
+    if HOUGH_SAVE_BAND_MASKS:
+        for band_name, band in band_specs.items():
+            path = Path(
+                per_building_out,
+                f"{geojson_base}__{facade_tag}__hough_{band_name}_band.png",
+            )
+            Image.fromarray(band.astype(np.uint8) * 255).save(path)
+            hough_band_paths[band_name] = path
+
+    info.update({
+        "left_line": None if left_line is None else left_line.tolist(),
+        "right_line": None if right_line is None else right_line.tolist(),
+        "selected_edges": [
+            {
+                "edge_index": int(edge["edge_index"]),
+                "target_p0": np.asarray(edge["target_p0"]).tolist(),
+                "target_p1": np.asarray(edge["target_p1"]).tolist(),
+                "target_length_px": float(edge["target_length_px"]),
+                "target_angle_deg": float(edge["target_angle_deg"]),
+                "side": edge.get("side"),
+                "selected_line": (
+                    None
+                    if edge.get("selected_line") is None
+                    else np.asarray(edge["selected_line"]).tolist()
+                ),
+                "info": edge.get("info", {}),
+            }
+            for edge in selected_edges
+        ],
+    })
+    return (
+        rgba,
+        info,
+        hough_overlay_path,
+        hough_warp_overlay_path,
+        hough_band_paths,
+        transformed_masks,
+    )
 
 def _safe_artifact_folder_part(value):
     text = str(value)
@@ -2895,25 +4118,18 @@ def _mark_selected_candidate_overlay(output_path):
 
 
 def _save_candidate_projection_screening_overlay(source, raw_outline_px, output_path):
-    """Show SAM3 guidance plus raw/fitted whole-model projection evidence."""
-    # Kept in the signature for compatibility with existing callers. Candidate
-    # global-fit diagnostics must not fall back to drawing the target wall.
-    del raw_outline_px
+    """Show guidance, whole-model fit evidence, and the fitted target wall."""
     image_rgb = np.asarray(source["img"].convert("RGB"), dtype=np.uint8)
-    candidate_guidance = source.get("depth_global_prefit_semantic_guidance")
+    candidate_guidance = source.get(
+        "depth_global_fit_semantic_guidance",
+        source.get("depth_global_prefit_semantic_guidance"),
+    )
     semantic_guidance_drawn = False
     if isinstance(candidate_guidance, dict):
         try:
             image_rgb = create_prefit_semantic_guidance_overlay(
                 image_rgb,
                 candidate_guidance,
-                line_thickness_px=max(
-                    1,
-                    int(globals().get(
-                        "MODEL_DEPTH_BOUNDARY_OVERLAY_LINE_THICKNESS_PX",
-                        1,
-                    )),
-                ),
                 # The raw model is drawn below from real projected model edges.
                 # Re-contouring this mask would recreate viewport closures.
                 draw_raw_projection_outline=False,
@@ -2956,13 +4172,12 @@ def _save_candidate_projection_screening_overlay(source, raw_outline_px, output_
                     )
                     if point0_on_frame and point1_on_frame:
                         continue
-                    cv2.line(
+                    draw_styled_line(
                         canvas,
-                        tuple(point0.tolist()),
-                        tuple(point1.tolist()),
-                        (0, 128, 255),
-                        1,
-                        cv2.LINE_AA,
+                        point0,
+                        point1,
+                        OSM_OBSTRUCTION_LINE,
+                        color_space="bgr",
                     )
 
     def finite_points(value):
@@ -2983,6 +4198,9 @@ def _save_candidate_projection_screening_overlay(source, raw_outline_px, output_
         fit_result_value
         if isinstance(fit_result_value, dict)
         else {}
+    )
+    fitted_target_wall_points = finite_points(
+        fit_result.get("depth_global_fitted_wall_outline_px", [])
     )
     real_model_points = finite_points(
         fit_result.get("fit_original_points", [])
@@ -3065,6 +4283,15 @@ def _save_candidate_projection_screening_overlay(source, raw_outline_px, output_
             fit_result.get("applied", False),
         )
     )
+    if fit_applied and fitted_target_wall_points.shape[0] < 3:
+        raw_target_wall_points = finite_points(
+            source.get("selection_visible_wall_outline_px", raw_outline_px)
+        )
+        if raw_target_wall_points.shape[0] >= 3:
+            fitted_target_wall_points = apply_H(
+                raw_target_wall_points,
+                projection_H,
+            )
     if fit_applied and (
         used_depth_fallback
         or fitted_model_points.shape != raw_model_points.shape
@@ -3091,12 +4318,7 @@ def _save_candidate_projection_screening_overlay(source, raw_outline_px, output_
     def draw_model_segments(
         points,
         segments,
-        color,
-        thickness,
-        *,
-        dashed=False,
-        dash_length_px=7.0,
-        dash_gap_px=5.0,
+        style: OverlayLineStyle,
     ):
         points = finite_points(points)
         drawn = False
@@ -3129,80 +4351,48 @@ def _save_candidate_projection_screening_overlay(source, raw_outline_px, output_
             )
             if not visible:
                 continue
-            if not dashed:
-                cv2.line(
-                    canvas,
-                    clipped0,
-                    clipped1,
-                    color,
-                    thickness,
-                    cv2.LINE_AA,
-                )
-                drawn = True
-                continue
-
-            point0_array = np.asarray(clipped0, dtype=np.float64)
-            point1_array = np.asarray(clipped1, dtype=np.float64)
-            vector = point1_array - point0_array
-            length = float(np.linalg.norm(vector))
-            if length < 1.0e-6:
-                continue
-            direction = vector / length
-            period = max(
-                float(dash_length_px) + float(dash_gap_px),
-                1.0,
+            draw_styled_line(
+                canvas,
+                clipped0,
+                clipped1,
+                style,
+                color_space="bgr",
             )
-            start_distance = 0.0
-            while start_distance < length:
-                end_distance = min(
-                    start_distance + max(float(dash_length_px), 1.0),
-                    length,
-                )
-                dash_start = point0_array + direction * start_distance
-                dash_end = point0_array + direction * end_distance
-                cv2.line(
-                    canvas,
-                    tuple(np.round(dash_start).astype(int)),
-                    tuple(np.round(dash_end).astype(int)),
-                    color,
-                    thickness,
-                    cv2.LINE_AA,
-                )
-                start_distance += period
             drawn = True
         return drawn
 
     raw_model_drawn = draw_model_segments(
         raw_model_points,
         model_segments,
-        (255, 220, 0),
-        2,
+        RAW_MODEL_LINE,
     )
     fitted_model_drawn = bool(
         fit_applied
         and draw_model_segments(
             fitted_model_points,
             model_segments,
-            (220, 0, 220),
-            2,
-            dashed=True,
-            dash_length_px=float(globals().get(
-                "MODEL_DEPTH_BOUNDARY_OVERLAY_DASH_LENGTH_PX",
-                7,
-            )),
-            dash_gap_px=float(globals().get(
-                "MODEL_DEPTH_BOUNDARY_OVERLAY_DASH_GAP_PX",
-                5,
-            )),
+            ACCEPTED_MODEL_LINE,
+        )
+    )
+    fitted_target_wall_drawn = bool(
+        fit_applied
+        and fitted_target_wall_points.shape[0] >= 3
+        and draw_model_segments(
+            fitted_target_wall_points,
+            [
+                (index, (index + 1) % fitted_target_wall_points.shape[0])
+                for index in range(fitted_target_wall_points.shape[0])
+            ],
+            ACCEPTED_MODEL_LINE,
         )
     )
 
     if raw_model_drawn:
+        geometry_line = model_projection_legend(fitted=fitted_model_drawn)
+    elif fitted_target_wall_drawn:
         geometry_line = (
-            "model: solid cyan=raw whole-model | "
-            "dashed magenta=accepted fitted whole-model"
-            if fitted_model_drawn
-            else "model: solid cyan=raw whole-model | no accepted fitted transform"
+            "whole-model projection unavailable; dashed magenta=fitted "
+            "target-wall projection"
         )
     else:
         geometry_line = (
@@ -3231,73 +4421,23 @@ def _save_candidate_projection_screening_overlay(source, raw_outline_px, output_
     )
     lines = []
     if semantic_guidance_drawn:
-        lines.extend([
-            (
-                "SAM3 fills: cyan=target building | yellow=target roof | "
-                "pink=excluded tree/vehicle"
-            ),
-            (
-                "SAM3 guides: yellow=roof (3x) | green=wall (2x) | "
-                "gray=base (0.35x) | blue=target boundary"
-            ),
-        ])
+        lines.extend(
+            BACKGROUND_AWARE_SEMANTIC_LEGEND_ROWS
+            if bool(candidate_guidance.get("background_aware_active", False))
+            else SEMANTIC_LEGEND_ROWS
+        )
+        if isinstance(
+            candidate_guidance.get("strict_roof_diagnostic_masks"),
+            dict,
+        ):
+            lines.append(STRICT_ROOF_AUDIT_LEGEND_ROW)
     lines.extend([
         geometry_line,
-        (
-            "orange=external OSM obstruction"
-            + (
-                " | darkened=outside projection-local model search"
-                if semantic_guidance_drawn
-                else ""
-            )
-        ),
+        OSM_LEGEND_ROW,
+        *([SEARCH_LEGEND_ROW] if semantic_guidance_drawn else []),
         f"depth-global {fit_status}{transform_text}{blocked_text}",
     ])
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.43
-    maximum_text_width = max(80, width - 16)
-    wrapped_lines = []
-    for line in lines:
-        words = line.split()
-        current = ""
-        for word in words:
-            proposal = word if not current else f"{current} {word}"
-            proposal_width = cv2.getTextSize(
-                proposal,
-                font,
-                font_scale,
-                1,
-            )[0][0]
-            if current and proposal_width > maximum_text_width:
-                wrapped_lines.append(current)
-                current = word
-            else:
-                current = proposal
-        if current:
-            wrapped_lines.append(current)
-
-    for line_index, line in enumerate(wrapped_lines):
-        y = 22 + line_index * 21
-        cv2.putText(
-            canvas,
-            line,
-            (8, y),
-            font,
-            font_scale,
-            (255, 255, 255),
-            3,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            canvas,
-            line,
-            (8, y),
-            font,
-            font_scale,
-            (20, 20, 20),
-            1,
-            cv2.LINE_AA,
-        )
+    draw_legend(canvas, lines, color_space="bgr")
     cv2.imwrite(str(output_path), canvas)
 
 
@@ -3324,6 +4464,10 @@ def _save_external_building_removal_preview(image_rgb, remove_mask, output_path)
 
 def _include_artifact_in_contact_sheet(path):
     n = Path(path).name.lower()
+    if "post_rectification_sam3" in n:
+        # Retired artifact from the older two-inference pipeline. Ignore stale
+        # files if an output folder is reused.
+        return False
     if "target_model_visibility" in n:
         return False
     if "model_depth_mm_u16" in n:
@@ -3404,21 +4548,34 @@ def _artifact_stage_label_and_rank(path):
     if "lr_band" in n or "lr_overlay" in n:
         return 500, "05 side crop / LR band"
     if "projection_cropped_facade" in n:
-        return 550, "06 facade cropped by selected wall projection"
+        return (
+            550,
+            "06 fitted wall crop + reused full-image SAM3 content mask",
+        )
     if "ortho_prefit" in n:
-        return 600, "07 projection-cropped facade after rectification"
-    if "post_rectification_sam3_instances" in n:
-        return 800, "09a post-rectification cleanup SAM instances after Hough"
-    if "post_rectification_sam3_overlay" in n:
-        return 810, "09b post-rectification cleanup SAM + guarded edge adjustment"
+        return 600, "07 reused full-image SAM3 mask after rectification"
+    if "reused_prefit_semantic_mask_after_hough" in n:
+        return (
+            800,
+            (
+                "09 reused full-image SAM3 mask after rectification + "
+                "Hough (no new inference)"
+            ),
+        )
     if "sam3_instances" in n:
         return 720, "legacy perspective SAM instances"
     if "sam3" in n:
         return 730, "legacy perspective SAM selection"
     if "hough_overlay" in n:
-        return 700, "08a bounded Hough line selection before SAM"
+        return (
+            700,
+            "08a bounded Hough lines on propagated semantic content",
+        )
     if "hough_warp" in n:
-        return 710, "08b bounded Hough warp adjustment before SAM"
+        return (
+            710,
+            "08b bounded Hough warp + semantic-mask propagation",
+        )
     if "hough_" in n and "_band" in n:
         return 720, "08 Hough search band"
     if "polygon_fit" in n or "ortho_fit" in n:
@@ -3628,7 +4785,10 @@ def _make_model_highlight_panel(all_rows, target_wall_indices, title, size=(420,
     draw.rectangle([legend_x + 10, legend_y + 12, legend_x + 28, legend_y + 28], fill=(238, 57, 70, 225), outline=(120, 20, 25, 255))
     legend_text = "highlighted group" if target_set else "no wall highlight"
     draw.text((legend_x + 36, legend_y + 11), legend_text, fill=(25, 25, 25, 255))
-    walls_text = "walls " + ",".join(str(i) for i in sorted(target_set)) if target_set else "unassigned"
+    walls_text = (
+        "walls " + ",".join(str(i) for i in sorted(target_set))
+        if target_set else "no wall indices"
+    )
     draw.text((legend_x + 10, legend_y + 32), _truncate_text(walls_text, 28), fill=(65, 65, 65, 255))
     if camera_point is not None:
         cy = legend_y + 52
@@ -3844,6 +5004,8 @@ def _save_wall_artifact_folders(per_building_out, geojson_base, viewer_index, ru
             key = ("wall", wall_idx)
         grouped_rows[key].append(row)
 
+    group_dir_by_wall_index = {}
+    contact_sheet_specs = []
     for key, rows in grouped_rows.items():
         wall_indices = []
         for row in rows:
@@ -3865,7 +5027,10 @@ def _save_wall_artifact_folders(per_building_out, geojson_base, viewer_index, ru
                 if isinstance(group_id, int)
                 else f"group_{_safe_artifact_folder_part(group_id)}__{_safe_artifact_folder_part(group_tag)}__{wall_label}"
             )
-            prefixes = [f"{geojson_base}__{group_tag}__"]
+            prefixes = [
+                f"{geojson_base}__{group_tag}__",
+                f"sv__{geojson_base}__{group_tag}__",
+            ]
             for row in rows:
                 try:
                     row_wall_idx = int(row.get("global_index", row.get("loop_index", -1)))
@@ -3887,6 +5052,8 @@ def _save_wall_artifact_folders(per_building_out, geojson_base, viewer_index, ru
 
         group_dir = artifact_root / folder_name
         group_dir.mkdir(parents=True, exist_ok=True)
+        for wall_idx in wall_indices:
+            group_dir_by_wall_index[int(wall_idx)] = group_dir
 
         summary = {
             "artifact_unit": "facade_group" if key[0] == "group" else "single_wall",
@@ -3927,54 +5094,42 @@ def _save_wall_artifact_folders(per_building_out, geojson_base, viewer_index, ru
                 if moved is not None:
                     row[field] = moved.relative_to(out_dir).as_posix()
 
+        contact_sheet_specs.append((
+            group_dir,
+            folder_name,
+            rows,
+            summary["artifact_unit"],
+        ))
+
+    # A wall index is already encoded in every per-wall/group artifact name.
+    # Use it as the final ownership fallback instead of inventing a catch-all
+    # pseudo-group. This also recovers artifacts written before
+    # a late processing exception can append its viewer-index row.
+    keep_root_names = {"viewer_index.json", "viewer_bundle.npz"}
+    for p in [x for x in out_dir.iterdir() if x.is_file()]:
+        if (
+            p.name in keep_root_names
+            or p.suffix.lower()
+            not in {".png", ".jpg", ".jpeg", ".json", ".npy"}
+        ):
+            continue
+        wall_idx = _artifact_wall_index_from_name(p.name)
+        destination = group_dir_by_wall_index.get(wall_idx)
+        if destination is None:
+            # Files with no wall identity are building-wide diagnostics.
+            destination = global_dir
+        moved_total += int(_move_if_file(p, destination) is not None)
+
+    # Build sheets only after every artifact has reached its real owner. An
+    # unresolved wall group therefore contains exactly its summary and the
+    # single geometry/legend contact sheet.
+    for group_dir, folder_name, rows, artifact_unit in contact_sheet_specs:
         _save_artifact_contact_sheet(
             group_dir,
             folder_name,
             rows,
             artifact_rows,
-            artifact_unit=summary["artifact_unit"],
-        )
-
-    unassigned_dir = artifact_root / "_unassigned"
-    keep_root_names = {"viewer_index.json", "viewer_bundle.npz"}
-    for p in [x for x in out_dir.iterdir() if x.is_file()]:
-        if p.name in keep_root_names or p.suffix.lower() not in {".png", ".jpg", ".jpeg", ".json"}:
-            continue
-        moved_total += int(_move_if_file(p, unassigned_dir) is not None)
-
-    if unassigned_dir.exists():
-        unassigned_wall_indices = sorted({
-            idx for idx in (
-                _artifact_wall_index_from_name(p.name)
-                for p in unassigned_dir.iterdir()
-                if p.is_file()
-            )
-            if idx is not None
-        })
-        all_rows_by_idx = {}
-        for row in artifact_rows:
-            try:
-                all_rows_by_idx[int(row.get("global_index", row.get("loop_index", -1)))] = row
-            except (TypeError, ValueError):
-                pass
-        unassigned_rows = [
-            all_rows_by_idx[idx]
-            for idx in unassigned_wall_indices
-            if idx in all_rows_by_idx
-        ]
-        with open(unassigned_dir / "group_summary.json", "w", encoding="utf-8") as f:
-            json.dump({
-                "artifact_unit": "unassigned",
-                "folder": "_unassigned",
-                "wall_indices": unassigned_wall_indices,
-                "rows": unassigned_rows,
-            }, f, ensure_ascii=False, indent=2)
-        _save_artifact_contact_sheet(
-            unassigned_dir,
-            "_unassigned",
-            unassigned_rows,
-            artifact_rows,
-            artifact_unit="unassigned",
+            artifact_unit=artifact_unit,
         )
 
     print(f"Saved group artifact folders: {artifact_root} ({len(grouped_rows)} folders, {moved_total} moved files)")
@@ -4230,153 +5385,6 @@ def _select_best_facade_instance(facade_stack, roof_mask, wall_poly_xy, H, W):
     return _select_facade_instances_for_wall(facade_stack, roof_mask, wall_poly_xy, H, W)
 
 
-def _run_post_rectification_sam(
-    *,
-    processor,
-    ortho_rgba,
-    allowed_wall_mask,
-    wall_poly_px,
-    primary_prompt,
-    refinement_prompt,
-    roof_prompt,
-):
-    """Run SAM on the rectified facade and constrain every result to its wall."""
-    rgba = np.asarray(ortho_rgba, dtype=np.uint8)
-    allowed = np.asarray(allowed_wall_mask, dtype=bool)
-    H, W = allowed.shape
-    result = {
-        "effective_refinement_mask": allowed.copy(),
-        "clipped_sam_mask": np.zeros_like(allowed),
-        "model_image": None,
-        "facade_stack": np.zeros((0, 1, 1), dtype=bool),
-        "roof_mask": np.zeros((1, 1), dtype=bool),
-        "selected_indices": [],
-        "scores": [],
-        "crop_bbox": None,
-        "info": {
-            "enabled": bool(globals().get("ENABLE_POST_RECTIFICATION_SAM", True)),
-            "stage": "after_projection_crop_and_rectification",
-            "accepted_for_refinement": False,
-            "fallback_to_projection_mask": True,
-            "reason": "not_run",
-        },
-    }
-    if not result["info"]["enabled"]:
-        result["info"]["reason"] = "disabled"
-        return result
-    if rgba.ndim != 3 or rgba.shape[:2] != (H, W) or rgba.shape[2] != 4:
-        result["info"]["reason"] = "invalid_rectified_rgba"
-        return result
-    if not allowed.any():
-        result["info"]["reason"] = "empty_projection_mask"
-        return result
-
-    ys, xs = np.where(allowed)
-    pad = 2
-    left = max(0, int(xs.min()) - pad)
-    top = max(0, int(ys.min()) - pad)
-    right = min(W, int(xs.max()) + 1 + pad)
-    bottom = min(H, int(ys.max()) + 1 + pad)
-    if right <= left or bottom <= top:
-        result["info"]["reason"] = "invalid_projection_crop"
-        return result
-
-    allowed_crop = allowed[top:bottom, left:right]
-    model_rgb = rgba[:, :, :3].copy()
-    model_rgb[~allowed] = 0
-    model_image = Image.fromarray(model_rgb[top:bottom, left:right]).convert("RGB")
-    crop_h, crop_w = allowed_crop.shape
-    wall_poly_crop = np.asarray(wall_poly_px, dtype=np.float64) - np.array(
-        [left, top], dtype=np.float64,
-    )
-    result.update({
-        "model_image": model_image,
-        "crop_bbox": [int(left), int(top), int(right), int(bottom)],
-    })
-
-    try:
-        with torch.no_grad():
-            state = processor.set_image(model_image)
-            out_facade = processor.set_text_prompt(state=state, prompt=primary_prompt)
-            facade_stack_raw = _extract_mask_stack(out_facade, crop_h, crop_w)
-            facade_stack = _gate_mask_stack(facade_stack_raw, allowed_crop)
-
-            out_roof = processor.set_text_prompt(state=state, prompt=roof_prompt)
-            roof_stack_raw = _extract_mask_stack(out_roof, crop_h, crop_w)
-            roof_stack = _gate_mask_stack(roof_stack_raw, allowed_crop)
-            roof_mask = _stack_union(roof_stack, crop_h, crop_w)
-            if ROOF_SUBTRACT_DILATE_PX and ROOF_SUBTRACT_DILATE_PX > 0:
-                radius = int(ROOF_SUBTRACT_DILATE_PX)
-                kernel = np.ones((2 * radius + 1, 2 * radius + 1), dtype=np.uint8)
-                roof_mask = cv2.dilate(
-                    roof_mask.astype(np.uint8) * 255,
-                    kernel,
-                    iterations=1,
-                ) > 0
-                roof_mask &= allowed_crop
-
-            selected_crop, selected_indices, scores, debug_stack, prompt_refinement = (
-                _select_facade_mask_with_optional_refinement(
-                    processor=processor,
-                    state=state,
-                    facade_stack=facade_stack,
-                    roof_mask=roof_mask,
-                    wall_poly_xy=wall_poly_crop,
-                    H=crop_h,
-                    W=crop_w,
-                    primary_prompt=primary_prompt,
-                    refinement_prompt=refinement_prompt,
-                    wall_mask_override=allowed_crop,
-                )
-            )
-    except Exception as exc:
-        result["info"].update({
-            "reason": f"sam_inference_failed: {exc}",
-            "crop_bbox": result["crop_bbox"],
-        })
-        return result
-
-    selected_full = np.zeros_like(allowed)
-    selected_full[top:bottom, left:right] = np.asarray(selected_crop, dtype=bool)
-    guard = constrain_post_rectification_sam_mask(
-        selected_full,
-        allowed,
-        minimum_pixels=int(globals().get("POST_RECTIFICATION_SAM_MIN_PIXELS", 250)),
-        minimum_wall_coverage=float(globals().get(
-            "POST_RECTIFICATION_SAM_MIN_WALL_COVERAGE", 0.15,
-        )),
-    )
-    guard_meta = {
-        key: value
-        for key, value in guard.items()
-        if key not in {"clipped_mask", "effective_refinement_mask"}
-    }
-    result.update({
-        "effective_refinement_mask": np.asarray(
-            guard["effective_refinement_mask"], dtype=bool,
-        ),
-        "clipped_sam_mask": np.asarray(guard["clipped_mask"], dtype=bool),
-        "facade_stack": debug_stack,
-        "roof_mask": roof_mask,
-        "selected_indices": [int(index) for index in selected_indices],
-        "scores": scores,
-        "info": {
-            "enabled": True,
-            "stage": "after_projection_crop_and_rectification",
-            "accepted_for_refinement": bool(guard["accepted"]),
-            "crop_bbox": result["crop_bbox"],
-            "facade_instances_raw": int(facade_stack_raw.shape[0]),
-            "facade_instances_inside_projection": int(facade_stack.shape[0]),
-            "roof_instances_raw": int(roof_stack_raw.shape[0]),
-            "selected_indices": [int(index) for index in selected_indices],
-            "mask_guard": guard_meta,
-            "prompt_refinement": prompt_refinement,
-            "fallback_to_projection_mask": bool(guard["fallback_to_projection_mask"]),
-            "reason": str(guard["reason"]),
-        },
-    })
-    return result
-
 def _depth_aware_region_fit_config():
     return DepthAwareRegionFitConfig(
         allow_rotation=bool(globals().get("DEPTH_AWARE_REGION_FIT_ALLOW_ROTATION", True)),
@@ -4393,9 +5401,76 @@ def _depth_aware_region_fit_config():
         minimum_final_precision=float(globals().get("DEPTH_AWARE_REGION_FIT_MIN_FINAL_PRECISION", 0.55)),
     )
 
-def _model_depth_boundary_fit_config():
+def _model_depth_boundary_fit_config(
+    *,
+    semantic_target_supported=True,
+    background_aware=False,
+):
+    semantic_target_supported = bool(semantic_target_supported)
+    background_aware = bool(background_aware)
+    if background_aware and semantic_target_supported:
+        scale_delta = float(globals().get(
+            "MODEL_DEPTH_BACKGROUND_AWARE_MAX_SCALE_DELTA",
+            0.25,
+        ))
+    else:
+        scale_delta = float(globals().get(
+            "MODEL_DEPTH_BOUNDARY_ANCHOR_MAX_SCALE_DELTA"
+            if semantic_target_supported
+            else "MODEL_DEPTH_BOUNDARY_MICRO_MAX_SCALE_DELTA",
+            0.10 if semantic_target_supported else 0.06,
+        ))
+    translation_norm = float(globals().get(
+        "MODEL_DEPTH_BOUNDARY_ANCHOR_MAX_TRANSLATION_PX"
+        if semantic_target_supported
+        else "MODEL_DEPTH_BOUNDARY_MICRO_MAX_TRANSLATION_PX",
+        50.0 if semantic_target_supported else 20.0,
+    ))
+    displacement_limit = float(globals().get(
+        "MODEL_DEPTH_BOUNDARY_ANCHOR_MAX_MEAN_DISPLACEMENT_PX"
+        if semantic_target_supported
+        else "MODEL_DEPTH_BOUNDARY_MICRO_MAX_MEAN_DISPLACEMENT_PX",
+        55.0 if semantic_target_supported else 20.0,
+    ))
+    coarse_translation_limit = min(48.0, translation_norm)
     return make_production_fit_config(
         allow_rotation=bool(globals().get("MODEL_DEPTH_BOUNDARY_FIT_ALLOW_ROTATION", False)),
+        coarse_scale_min=1.0 - scale_delta,
+        coarse_scale_max=1.0 + scale_delta,
+        coarse_tx_min=-coarse_translation_limit,
+        coarse_tx_max=coarse_translation_limit,
+        coarse_tx_step=8.0 if semantic_target_supported else 4.0,
+        coarse_ty_min=-coarse_translation_limit,
+        coarse_ty_max=coarse_translation_limit,
+        coarse_ty_step=8.0 if semantic_target_supported else 4.0,
+        maximum_translation_x_px=translation_norm,
+        maximum_translation_y_px=translation_norm,
+        maximum_translation_norm_px=translation_norm,
+        maximum_translation_norm_fraction=float(globals().get(
+            "MODEL_DEPTH_BOUNDARY_ANCHOR_MAX_TRANSLATION_FRACTION",
+            0.25,
+        )),
+        maximum_mean_displacement_px=displacement_limit,
+        maximum_mean_displacement_fraction=float(globals().get(
+            "MODEL_DEPTH_BOUNDARY_ANCHOR_MAX_DISPLACEMENT_FRACTION",
+            0.25,
+        )),
+        minimum_anchor_iou=float(globals().get(
+            "MODEL_DEPTH_BOUNDARY_ANCHOR_MIN_IOU",
+            0.35,
+        )),
+        weight_translation_prior=float(globals().get(
+            "MODEL_DEPTH_BOUNDARY_ANCHOR_TRANSLATION_PRIOR_WEIGHT",
+            0.40,
+        )),
+        translation_prior_sigma_x=float(globals().get(
+            "MODEL_DEPTH_BOUNDARY_ANCHOR_TRANSLATION_PRIOR_SIGMA_PX",
+            40.0,
+        )),
+        translation_prior_sigma_y=float(globals().get(
+            "MODEL_DEPTH_BOUNDARY_ANCHOR_TRANSLATION_PRIOR_SIGMA_PX",
+            40.0,
+        )),
         image_border_epsilon_px=float(globals().get(
             "MODEL_DEPTH_BOUNDARY_IMAGE_BORDER_EPSILON_PX",
             0.5,
@@ -4423,7 +5498,11 @@ def _model_depth_boundary_fit_config():
     )
 
 
-def _model_depth_prefit_semantic_config(image_shape_hw=None):
+def _model_depth_prefit_semantic_config(
+    image_shape_hw=None,
+    *,
+    target_wall_visibility=False,
+):
     if image_shape_hw is None:
         scale_factor = 1.0
     else:
@@ -4432,14 +5511,24 @@ def _model_depth_prefit_semantic_config(image_shape_hw=None):
             0.75,
             3.0,
         ))
+    search_margin_name = (
+        "MODEL_DEPTH_PREFIT_TARGET_WALL_SEARCH_MARGIN_PX"
+        if target_wall_visibility
+        else "MODEL_DEPTH_PREFIT_SEARCH_MARGIN_PX"
+    )
+    association_margin_name = (
+        "MODEL_DEPTH_PREFIT_TARGET_WALL_ASSOCIATION_MARGIN_PX"
+        if target_wall_visibility
+        else "MODEL_DEPTH_PREFIT_ASSOCIATION_MARGIN_PX"
+    )
     return PrefitSemanticGuidanceConfig(
         search_dilation_px=int(round(scale_factor * int(globals().get(
-            "MODEL_DEPTH_PREFIT_SEARCH_MARGIN_PX",
-            96,
+            search_margin_name,
+            32 if target_wall_visibility else 96,
         )))),
         target_association_distance_px=scale_factor * float(globals().get(
-            "MODEL_DEPTH_PREFIT_ASSOCIATION_MARGIN_PX",
-            48,
+            association_margin_name,
+            24 if target_wall_visibility else 48,
         )),
         target_min_overlap_fraction=float(globals().get(
             "MODEL_DEPTH_PREFIT_MIN_TARGET_PROJECTION_OVERLAP",
@@ -4455,10 +5544,50 @@ def _model_depth_prefit_semantic_config(image_shape_hw=None):
                 80,
             ))
         )),
-        occluder_dilation_px=int(round(scale_factor * int(globals().get(
+        # This is a literal image-space safety radius, not a resolution-scaled
+        # fitting parameter.
+        occluder_dilation_px=int(globals().get(
             "MODEL_DEPTH_PREFIT_OCCLUDER_DILATION_PX",
-            7,
-        )))),
+            3,
+        )),
+        generic_non_target_enabled=bool(globals().get(
+            "ENABLE_MODEL_DEPTH_PREFIT_GENERIC_NON_TARGET",
+            True,
+        )),
+        generic_non_target_min_target_coverage=float(globals().get(
+            "MODEL_DEPTH_PREFIT_GENERIC_MIN_TARGET_COVERAGE",
+            0.20,
+        )),
+        generic_non_target_projection_inset_px=int(round(
+            scale_factor * int(globals().get(
+                "MODEL_DEPTH_PREFIT_GENERIC_PROJECTION_INSET_PX",
+                3,
+            ))
+        )),
+        generic_non_target_target_dilation_px=int(round(
+            scale_factor * int(globals().get(
+                "MODEL_DEPTH_PREFIT_GENERIC_TARGET_DILATION_PX",
+                2,
+            ))
+        )),
+        generic_non_target_min_component_area_px=int(round(
+            scale_factor * scale_factor * int(globals().get(
+                "MODEL_DEPTH_PREFIT_GENERIC_MIN_COMPONENT_AREA_PX",
+                80,
+            ))
+        )),
+        generic_non_target_max_component_fraction=float(globals().get(
+            "MODEL_DEPTH_PREFIT_GENERIC_MAX_COMPONENT_FRACTION",
+            0.20,
+        )),
+        generic_non_target_max_total_fraction=float(globals().get(
+            "MODEL_DEPTH_PREFIT_GENERIC_MAX_TOTAL_FRACTION",
+            0.45,
+        )),
+        generic_non_target_max_target_overlap_fraction=float(globals().get(
+            "MODEL_DEPTH_PREFIT_GENERIC_MAX_TARGET_OVERLAP_FRACTION",
+            0.15,
+        )),
         context_adjacency_px=int(round(scale_factor * int(globals().get(
             "MODEL_DEPTH_PREFIT_INTERFACE_DILATION_PX",
             5,
@@ -4474,6 +5603,99 @@ def _model_depth_prefit_semantic_config(image_shape_hw=None):
                 2,
             )))),
         ),
+        strict_roof_guidance_enabled=bool(globals().get(
+            "ENABLE_MODEL_DEPTH_PREFIT_STRICT_ROOF_GUIDANCE",
+            True,
+        )),
+        strict_roof_projected_band_radius_px=max(8, int(round(
+            scale_factor * int(globals().get(
+                "MODEL_DEPTH_PREFIT_STRICT_ROOF_BAND_RADIUS_PX",
+                18,
+            ))
+        ))),
+        strict_roof_upper_building_fraction=float(globals().get(
+            "MODEL_DEPTH_PREFIT_STRICT_ROOF_UPPER_BUILDING_FRACTION",
+            0.48,
+        )),
+        strict_roof_attachment_radius_px=max(4, int(round(
+            scale_factor * int(globals().get(
+                "MODEL_DEPTH_PREFIT_STRICT_ROOF_ATTACHMENT_RADIUS_PX",
+                8,
+            ))
+        ))),
+        strict_roof_min_band_pixels=max(6, int(round(
+            scale_factor * int(globals().get(
+                "MODEL_DEPTH_PREFIT_STRICT_ROOF_MIN_BAND_PIXELS",
+                12,
+            ))
+        ))),
+        strict_roof_min_band_span_fraction=float(globals().get(
+            "MODEL_DEPTH_PREFIT_STRICT_ROOF_MIN_BAND_SPAN_FRACTION",
+            0.03,
+        )),
+        strict_roof_min_attachment_pixels=max(6, int(round(
+            scale_factor * int(globals().get(
+                "MODEL_DEPTH_PREFIT_STRICT_ROOF_MIN_ATTACHMENT_PIXELS",
+                12,
+            ))
+        ))),
+        strict_roof_max_explicit_foreground_fraction=float(globals().get(
+            "MODEL_DEPTH_PREFIT_STRICT_ROOF_MAX_FOREGROUND_FRACTION",
+            0.35,
+        )),
+        strict_roof_context_radius_px=max(2, int(round(
+            scale_factor * int(globals().get(
+                "MODEL_DEPTH_PREFIT_STRICT_ROOF_CONTEXT_RADIUS_PX",
+                3,
+            ))
+        ))),
+        strict_roof_foreground_guard_radius_px=max(
+            int(globals().get("MODEL_DEPTH_PREFIT_OCCLUDER_DILATION_PX", 3)),
+            int(round(scale_factor * int(globals().get(
+                "MODEL_DEPTH_PREFIT_STRICT_ROOF_FOREGROUND_GUARD_RADIUS_PX",
+                4,
+            )))),
+        ),
+        strict_roof_vegetation_projection_inset_px=max(1, int(round(
+            scale_factor * int(globals().get(
+                "MODEL_DEPTH_PREFIT_STRICT_ROOF_VEGETATION_INSET_PX",
+                2,
+            ))
+        ))),
+        strict_roof_vegetation_inside_offset_px=max(4, int(round(
+            scale_factor * int(globals().get(
+                "MODEL_DEPTH_PREFIT_STRICT_ROOF_VEGETATION_INSIDE_OFFSET_PX",
+                8,
+            ))
+        ))),
+        strict_roof_min_guide_component_pixels=max(3, int(round(
+            scale_factor * int(globals().get(
+                "MODEL_DEPTH_PREFIT_STRICT_ROOF_MIN_GUIDE_COMPONENT_PIXELS",
+                5,
+            ))
+        ))),
+        strict_roof_bridge_enabled=bool(globals().get(
+            "ENABLE_MODEL_DEPTH_PREFIT_STRICT_ROOF_BRIDGE_DIAGNOSTIC",
+            True,
+        )),
+        strict_roof_bridge_min_endpoint_run_px=max(2, int(round(
+            scale_factor * int(globals().get(
+                "MODEL_DEPTH_PREFIT_STRICT_ROOF_BRIDGE_MIN_ENDPOINT_RUN_PX",
+                3,
+            ))
+        ))),
+        strict_roof_bridge_max_gap_px=max(24, int(round(
+            scale_factor * int(globals().get(
+                "MODEL_DEPTH_PREFIT_STRICT_ROOF_BRIDGE_MAX_GAP_PX",
+                64,
+            ))
+        ))),
+        strict_roof_bridge_domain_dilation_px=max(1, int(round(
+            scale_factor * int(globals().get(
+                "MODEL_DEPTH_PREFIT_STRICT_ROOF_BRIDGE_DOMAIN_DILATION_PX",
+                2,
+            ))
+        ))),
     )
 
 
@@ -4482,10 +5704,15 @@ def _model_depth_prefit_prompt_library():
         "MODEL_DEPTH_PREFIT_SEMANTIC_PROMPT_LIBRARY",
         {
             "building": ("building",),
-            "roof": ("roof",),
+            "roof": ("building roof",),
             "sky": ("sky",),
             "vegetation": ("tree",),
             "ground": ("ground",),
+            "occluder": ("vehicle", "traffic sign"),
+            "generic_occluder": (
+                "foreground object",
+                "object in front of building",
+            ),
         },
     )
     if not isinstance(configured, dict):
@@ -4505,11 +5732,40 @@ def _model_depth_prefit_prompt_library():
     return normalized
 
 
+def _model_depth_prefit_downstream_roof_prompts():
+    """Return bare-roof prompts reserved for downstream cleanup evidence."""
+    configured = globals().get(
+        "MODEL_DEPTH_PREFIT_DOWNSTREAM_ROOF_PROMPTS",
+        ("roof",),
+    )
+    if isinstance(configured, str):
+        configured = (configured,)
+    prompts = []
+    for raw_prompt in configured or ():
+        prompt = str(raw_prompt).strip()
+        if prompt and prompt not in prompts:
+            prompts.append(prompt)
+    if (
+        bool(globals().get(
+            "ENABLE_MODEL_DEPTH_PREFIT_STRICT_ROOF_GUIDANCE",
+            True,
+        ))
+        and not prompts
+    ):
+        raise ValueError(
+            "Strict pre-fit roof guidance requires at least one distinct "
+            "MODEL_DEPTH_PREFIT_DOWNSTREAM_ROOF_PROMPTS entry."
+        )
+    return prompts
+
+
 def _run_model_depth_prefit_semantic_guidance(
     *,
     processor,
     image_rgb,
     raw_projection_mask,
+    target_wall_projection_mask=None,
+    external_exclusion_mask=None,
     stage,
 ):
     """Run one automatic SAM3 prompt library and anchor it to the model mask."""
@@ -4526,8 +5782,28 @@ def _run_model_depth_prefit_semantic_guidance(
         raise ValueError(
             "Pre-fit semantic projection mask must match the PIL RGB image."
         )
+    if target_wall_projection_mask is None:
+        target_wall_projection = None
+    else:
+        target_wall_projection = np.asarray(
+            target_wall_projection_mask,
+            dtype=bool,
+        )
+        if target_wall_projection.shape != expected_shape:
+            raise ValueError(
+                "Target-wall semantic projection must match the PIL RGB image."
+            )
+    if external_exclusion_mask is None:
+        external_exclusion = None
+    else:
+        external_exclusion = np.asarray(external_exclusion_mask, dtype=bool)
+        if external_exclusion.shape != expected_shape:
+            raise ValueError(
+                "Pre-fit external exclusion must match the PIL RGB image."
+            )
 
     prompt_library = _model_depth_prefit_prompt_library()
+    downstream_roof_prompts = _model_depth_prefit_downstream_roof_prompts()
     role_stacks = {}
     prompt_results = []
     embedding_computed = False
@@ -4588,35 +5864,124 @@ def _run_model_depth_prefit_semantic_guidance(
             else np.zeros((0, height, width), dtype=bool)
         )
 
+    downstream_roof_stacks = []
+    for prompt in downstream_roof_prompts:
+        row = {
+            "role": "downstream_roof",
+            "prompt": str(prompt),
+            "instance_count": 0,
+            "status": "not_run",
+        }
+        if state is None:
+            row["status"] = "image_embedding_unavailable"
+            prompt_results.append(row)
+            continue
+        try:
+            with torch.no_grad():
+                output = processor.set_text_prompt(
+                    state=state,
+                    prompt=prompt,
+                )
+            stack = _extract_mask_stack(output, height, width)
+            if stack.shape[0] > 0:
+                downstream_roof_stacks.append(stack)
+            row.update({
+                "status": "ok",
+                "instance_count": int(stack.shape[0]),
+                "pixel_count": int(stack.any(axis=0).sum())
+                if stack.shape[0] > 0 else 0,
+            })
+        except Exception as exc:
+            row.update({
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+        prompt_results.append(row)
+    downstream_roof_stack = (
+        np.concatenate(downstream_roof_stacks, axis=0)
+        if downstream_roof_stacks
+        else np.zeros((0, height, width), dtype=bool)
+    )
+
     guidance = build_prefit_semantic_guidance(
         role_stacks,
         projection,
         config=_model_depth_prefit_semantic_config(projection.shape),
+        external_exclusion_mask=external_exclusion,
+        downstream_roof_mask_stack=downstream_roof_stack,
     )
-    metadata = dict(guidance.get("metadata", {}))
+    whole_model_target_pixels = int(np.asarray(
+        guidance.get("target_semantic_mask", np.zeros(projection.shape, dtype=bool)),
+        dtype=bool,
+    ).sum())
+    whole_model_projection_pixels = int(projection.sum())
+    whole_model_target_area_ratio = float(
+        whole_model_target_pixels / max(whole_model_projection_pixels, 1)
+    )
+    guidance["whole_model_projection_pixels"] = whole_model_projection_pixels
+    target_wall_guidance = None
+    if target_wall_projection is not None:
+        target_wall_guidance = build_prefit_semantic_guidance(
+            role_stacks,
+            target_wall_projection,
+            config=_model_depth_prefit_semantic_config(
+                projection.shape,
+                target_wall_visibility=True,
+            ),
+            external_exclusion_mask=external_exclusion,
+            downstream_roof_mask_stack=downstream_roof_stack,
+        )
     semantic_instance_count = int(sum(
         stack.shape[0] for stack in role_stacks.values()
     ))
-    metadata.update({
+    runtime_metadata = {
         "enabled": True,
         "stage": str(stage),
-        "method": "sam3_fixed_prompt_library_projection_local",
+        "method": (
+            "sam3_prompt_library_plus_projection_local_non_target_residual"
+        ),
         "manual_prompt_required": False,
         "promptless_everything_mode": False,
         "prompt_library": {
             role: list(prompts)
             for role, prompts in prompt_library.items()
         },
+        "downstream_roof_prompts": list(downstream_roof_prompts),
         "prompt_results": prompt_results,
         "image_embedding_computed": bool(embedding_computed),
         "image_embedding_error": embedding_error,
         "semantic_instance_count": semantic_instance_count,
+        "downstream_roof_instance_count": int(
+            downstream_roof_stack.shape[0]
+        ),
+        "roof_prompt_stage_separated": True,
         "segmentation_available": bool(semantic_instance_count > 0),
         # Even a failed SAM call retains the hard projection-local search mask.
         "used_for_fitting": True,
-    })
+    }
+    metadata = dict(guidance.get("metadata", {}))
+    metadata.update(runtime_metadata)
     guidance["metadata"] = metadata
     guidance["raw_projection_mask"] = projection.copy()
+    if target_wall_guidance is not None:
+        target_metadata = dict(target_wall_guidance.get("metadata", {}))
+        target_metadata.update(runtime_metadata)
+        target_metadata.update({
+            "used_for_fitting": False,
+            "used_for_candidate_visibility": True,
+            "projection_scope": "target_wall",
+            "whole_model_target_semantic_pixels": whole_model_target_pixels,
+            "whole_model_projection_pixels": whole_model_projection_pixels,
+            "whole_model_target_area_ratio": whole_model_target_area_ratio,
+        })
+        target_wall_guidance["metadata"] = target_metadata
+        target_wall_guidance["whole_model_target_area_ratio"] = (
+            whole_model_target_area_ratio
+        )
+        target_wall_guidance["whole_model_projection_pixels"] = (
+            whole_model_projection_pixels
+        )
+        guidance["target_wall_guidance"] = target_wall_guidance
     return guidance
 
 
@@ -4625,27 +5990,61 @@ def _combine_model_depth_fit_evidence(
     image_shape_hw,
     *,
     external_exclusion_mask=None,
+    background_aware=False,
 ):
     """Combine SAM/locality and OSM masks without changing canvas coordinates."""
     height, width = (int(image_shape_hw[0]), int(image_shape_hw[1]))
     shape = (height, width)
     valid = None
+    semantic_valid = None
     boundary_maps = None
     metadata = {}
     overlay_guidance = guidance
 
     if guidance is not None:
-        valid = np.asarray(guidance["valid_evidence_mask"], dtype=bool).copy()
+        valid_key = (
+            "background_aware_valid_evidence_mask"
+            if background_aware
+            else "valid_evidence_mask"
+        )
+        boundary_key = (
+            "background_aware_boundary_maps"
+            if background_aware
+            else "boundary_maps"
+        )
+        valid = np.asarray(guidance[valid_key], dtype=bool).copy()
         if valid.shape != shape:
             raise ValueError(
                 "Pre-fit semantic evidence mask must match the fitting image."
             )
         boundary_maps = {
             str(label): np.asarray(mask, dtype=bool)
-            for label, mask in dict(guidance.get("boundary_maps", {})).items()
+            for label, mask in dict(guidance.get(boundary_key, {})).items()
         }
+        if background_aware:
+            semantic_valid = np.asarray(
+                guidance.get("semantic_valid_evidence_mask", valid),
+                dtype=bool,
+            ).copy()
+            if semantic_valid.shape != shape:
+                raise ValueError(
+                    "Semantic evidence mask must match the fitting image."
+                )
         metadata = dict(guidance.get("metadata", {}))
         metadata["used_for_fitting"] = True
+        metadata["fit_evidence_mode"] = (
+            "foreground_background_split"
+            if background_aware
+            else "legacy_incumbent"
+        )
+        if background_aware:
+            metadata["legacy_boundary_pixels_by_class"] = dict(
+                metadata.get("boundary_pixels_by_class", {})
+            )
+            metadata["boundary_pixels_by_class"] = {
+                str(label): int(np.asarray(mask, dtype=bool).sum())
+                for label, mask in boundary_maps.items()
+            }
 
     external = None
     if external_exclusion_mask is not None:
@@ -4657,6 +6056,8 @@ def _combine_model_depth_fit_evidence(
         if valid is None:
             valid = np.ones(shape, dtype=bool)
         valid &= ~external
+        if semantic_valid is not None:
+            semantic_valid &= ~external
 
     if valid is not None:
         metadata.update({
@@ -4669,6 +6070,13 @@ def _combine_model_depth_fit_evidence(
         if guidance is not None:
             overlay_guidance = dict(guidance)
             overlay_guidance["valid_evidence_mask"] = valid
+            overlay_guidance["boundary_maps"] = boundary_maps
+            if semantic_valid is not None:
+                overlay_guidance["semantic_valid_evidence_mask"] = (
+                    semantic_valid
+                )
+            if background_aware:
+                overlay_guidance["background_aware_active"] = True
             local_search = np.asarray(
                 guidance.get("local_search_mask", np.ones(shape, dtype=bool)),
                 dtype=bool,
@@ -4680,10 +6088,220 @@ def _combine_model_depth_fit_evidence(
 
     return {
         "valid_evidence_mask": valid,
+        "semantic_valid_evidence_mask": semantic_valid,
         "boundary_maps": boundary_maps,
         "metadata": metadata,
         "overlay_guidance": overlay_guidance,
     }
+
+
+def _background_aware_recovery_eligibility(guidance):
+    """Detect the general failure mode where foreground masking hides the roof.
+
+    The threshold is intentionally semantic and wall-independent: recovery is
+    considered only when more than half of the highest-priority roof guide was
+    removed by the incumbent mask and the split restores a material run.
+    """
+    result = {
+        "eligible": False,
+        "reason": "guidance_unavailable",
+        "legacy_roof_pixels": 0,
+        "full_roof_pixels": 0,
+        "restored_roof_pixels": 0,
+        "legacy_roof_retention": 1.0,
+    }
+    if not isinstance(guidance, Mapping):
+        return result
+    legacy_maps = guidance.get("boundary_maps", {})
+    full_maps = guidance.get("background_aware_boundary_maps", {})
+    if not isinstance(legacy_maps, Mapping) or not isinstance(full_maps, Mapping):
+        result["reason"] = "background_aware_maps_unavailable"
+        return result
+    legacy_roof = np.asarray(legacy_maps.get("roof", []), dtype=bool)
+    full_roof = np.asarray(full_maps.get("roof", []), dtype=bool)
+    if legacy_roof.ndim != 2 or full_roof.shape != legacy_roof.shape:
+        result["reason"] = "roof_map_shape_mismatch"
+        return result
+    full_pixels = int(full_roof.sum())
+    legacy_pixels = int((legacy_roof & full_roof).sum())
+    restored_pixels = int((full_roof & (~legacy_roof)).sum())
+    retention = float(legacy_pixels / max(full_pixels, 1))
+    result.update({
+        "legacy_roof_pixels": legacy_pixels,
+        "full_roof_pixels": full_pixels,
+        "restored_roof_pixels": restored_pixels,
+        "legacy_roof_retention": retention,
+    })
+    if full_pixels <= 0:
+        result["reason"] = "no_roof_guide"
+        return result
+    maximum_retention = float(globals().get(
+        "MODEL_DEPTH_BACKGROUND_AWARE_MAX_LEGACY_ROOF_RETENTION",
+        0.50,
+    ))
+    minimum_restored = int(globals().get(
+        "MODEL_DEPTH_BACKGROUND_AWARE_MIN_RESTORED_ROOF_PIXELS",
+        64,
+    ))
+    if retention > maximum_retention:
+        result["reason"] = "legacy_roof_guide_sufficient"
+        return result
+    if restored_pixels < minimum_restored:
+        result["reason"] = "restored_roof_run_too_small"
+        return result
+    result["eligible"] = True
+    result["reason"] = "majority_of_roof_guide_was_masked"
+    return result
+
+
+def _common_semantic_alignment(
+    fit_result,
+    boundary_maps,
+    image_shape_hw,
+    fit_config,
+    *,
+    included_classes=None,
+):
+    if not isinstance(fit_result, Mapping):
+        return {
+            "score": 0.0,
+            "sample_count": 0,
+            "classes": list(included_classes or []),
+        }
+    points = np.asarray(
+        fit_result.get("fit_fitted_points", []),
+        dtype=np.float64,
+    ).reshape(-1, 2)
+    segments = list(fit_result.get("fit_segment_indices", []))
+    classes = list(fit_result.get("fit_segment_classes", []))
+    weights = np.asarray(
+        fit_result.get("fit_segment_weights", []),
+        dtype=np.float64,
+    ).reshape(-1)
+    if (
+        len(points) < 2
+        or not segments
+        or len(segments) != len(classes)
+        or len(segments) != len(weights)
+    ):
+        return {
+            "score": 0.0,
+            "sample_count": 0,
+            "classes": list(included_classes or []),
+        }
+    return semantic_boundary_alignment_score(
+        points,
+        segments,
+        classes,
+        weights,
+        boundary_maps,
+        image_shape_hw,
+        config=fit_config,
+        included_classes=included_classes,
+    )
+
+
+def _full_roof_alignment(fit_result, boundary_maps, image_shape_hw, fit_config):
+    return _common_semantic_alignment(
+        fit_result,
+        boundary_maps,
+        image_shape_hw,
+        fit_config,
+        included_classes=("roof",),
+    )
+
+
+def _choose_background_aware_fit(
+    incumbent,
+    challenger,
+    *,
+    full_boundary_maps,
+    image_shape_hw,
+    comparison_config,
+    eligibility,
+):
+    """Choose a challenger only for a clear, anchor-safe roof improvement."""
+    incumbent_roof = _full_roof_alignment(
+        incumbent,
+        full_boundary_maps,
+        image_shape_hw,
+        comparison_config,
+    )
+    challenger_roof = _full_roof_alignment(
+        challenger,
+        full_boundary_maps,
+        image_shape_hw,
+        comparison_config,
+    )
+    incumbent_common = _common_semantic_alignment(
+        incumbent,
+        full_boundary_maps,
+        image_shape_hw,
+        comparison_config,
+    )
+    challenger_common = _common_semantic_alignment(
+        challenger,
+        full_boundary_maps,
+        image_shape_hw,
+        comparison_config,
+    )
+    gain = float(challenger_roof["score"] - incumbent_roof["score"])
+    minimum_gain = float(globals().get(
+        "MODEL_DEPTH_BACKGROUND_AWARE_MIN_FULL_ROOF_SCORE_GAIN",
+        0.08,
+    ))
+    common_semantic_gain = float(
+        challenger_common["score"] - incumbent_common["score"]
+    )
+    maximum_common_drop = float(globals().get(
+        "MODEL_DEPTH_BACKGROUND_AWARE_MAX_COMMON_SEMANTIC_SCORE_DROP",
+        0.02,
+    ))
+    accepted = bool(
+        challenger.get("applied", False)
+        and challenger.get("anchor_motion_gate_passed", False)
+        and challenger.get("anchor_iou_gate_passed", False)
+        and int(challenger_roof.get("sample_count", 0)) > 0
+        and gain >= minimum_gain
+        and common_semantic_gain >= -maximum_common_drop
+    )
+    decision = {
+        **dict(eligibility),
+        "accepted": accepted,
+        "reason": (
+            "accepted_material_full_roof_alignment_gain"
+            if accepted
+            else (
+                "kept_incumbent_common_semantic_regression"
+                if common_semantic_gain < -maximum_common_drop
+                else "kept_incumbent_no_material_full_roof_gain"
+            )
+        ),
+        "incumbent_full_roof_score": float(incumbent_roof["score"]),
+        "challenger_full_roof_score": float(challenger_roof["score"]),
+        "full_roof_score_gain": gain,
+        "minimum_full_roof_score_gain": minimum_gain,
+        "incumbent_full_roof_samples": int(incumbent_roof["sample_count"]),
+        "challenger_full_roof_samples": int(challenger_roof["sample_count"]),
+        "incumbent_common_semantic_score": float(incumbent_common["score"]),
+        "challenger_common_semantic_score": float(challenger_common["score"]),
+        "common_semantic_score_gain": common_semantic_gain,
+        "maximum_common_semantic_score_drop": maximum_common_drop,
+        "incumbent_common_semantic_samples": int(
+            incumbent_common["sample_count"]
+        ),
+        "challenger_common_semantic_samples": int(
+            challenger_common["sample_count"]
+        ),
+    }
+    if not accepted:
+        # Returning the original object preserves every incumbent field and
+        # transform exactly when the new interpretation is not demonstrably
+        # better.
+        return incumbent, decision
+    selected = dict(challenger)
+    selected["background_aware_recovery"] = decision
+    return selected, decision
 
 
 def _finalize_selected_osm_masked_depth_refit(
@@ -4792,7 +6410,12 @@ def _finalize_selected_osm_masked_depth_refit(
     return result
 
 
-def _prepare_osm_building_occlusion_context(geojson_path, base_z):
+def _prepare_osm_building_occlusion_context(
+    geojson_path,
+    base_z,
+    *,
+    camera_elevation_resolver=None,
+):
     configured = bool(globals().get(
         "ENABLE_OSM_EXTERNAL_BUILDING_OCCLUSION",
         True,
@@ -4817,6 +6440,8 @@ def _prepare_osm_building_occlusion_context(geojson_path, base_z):
         "blocker_lookup": {},
         "metadata": None,
         "excluded_target_buildings": [],
+        "blocker_terrain_metadata": {},
+        "blocker_terrain_source": "not_available",
     }
     if not enabled:
         return context
@@ -4862,9 +6487,32 @@ def _prepare_osm_building_occlusion_context(geojson_path, base_z):
             buildings,
             model_geometry["footprint"],
         )
+        terrain_sampler = None
+        terrain_reason = "disabled"
+        if bool(globals().get("OSM_BUILDING_USE_DGM_TERRAIN", True)):
+            validation = getattr(camera_elevation_resolver, "validation", None)
+            sampler = getattr(camera_elevation_resolver, "sampler", None)
+            if bool(getattr(validation, "consistent", False)) and sampler is not None:
+                terrain_sampler = sampler.sample
+                terrain_reason = "validated_dgm"
+            else:
+                terrain_reason = (
+                    "dgm_base_validation_unavailable_or_failed"
+                )
+        blocker_terrain_metadata = {}
         blocker_meshes, blocker_lookup = build_osm_blocker_meshes(
             blockers,
             ground_z=float(base_z),
+            ground_z_sampler=terrain_sampler,
+            maximum_terrain_samples=int(globals().get(
+                "OSM_BUILDING_TERRAIN_MAX_SAMPLES",
+                9,
+            )),
+            terrain_top_margin_m=float(globals().get(
+                "OSM_BUILDING_TERRAIN_TOP_MARGIN_M",
+                0.5,
+            )),
+            terrain_metadata=blocker_terrain_metadata,
         )
         context.update({
             "available": True,
@@ -4873,6 +6521,8 @@ def _prepare_osm_building_occlusion_context(geojson_path, base_z):
             "blocker_lookup": blocker_lookup,
             "metadata": osm_metadata,
             "excluded_target_buildings": excluded,
+            "blocker_terrain_metadata": blocker_terrain_metadata,
+            "blocker_terrain_source": terrain_reason,
             "nearby_building_count": int(len(buildings)),
             "external_blocker_count": int(len(blocker_meshes)),
         })
@@ -4903,20 +6553,23 @@ def _score_candidate_external_building_occlusion(
     source_index,
 ):
     if not bool(osm_context.get("available", False)):
-        return
+        return None
     if not target_meshes or not target_quads:
         source["external_building_occlusion_reason"] = "target_geometry_unavailable"
-        return
+        return None
 
     try:
-        raw_target_depth = render_model_depth_map(
-            target_meshes,
-            source["K"],
-            source["Rwc"],
-            source["C"],
-            source["img"].size,
-            near_m=float(globals().get("MODEL_DEPTH_NEAR_M", 0.05)),
-        )
+        raw_target_depth = source.get("_external_building_raw_target_depth")
+        if raw_target_depth is None:
+            raw_target_depth = render_model_depth_map(
+                target_meshes,
+                source["K"],
+                source["Rwc"],
+                source["C"],
+                source["img"].size,
+                near_m=float(globals().get("MODEL_DEPTH_NEAR_M", 0.05)),
+            )
+            source["_external_building_raw_target_depth"] = raw_target_depth
         width, height = source["img"].size
         candidate = {
             "camera_utm_xyz": [
@@ -4942,6 +6595,10 @@ def _score_candidate_external_building_occlusion(
             corridor_buffer_m=float(globals().get(
                 "OSM_BUILDING_CORRIDOR_BUFFER_M", 1.0,
             )),
+            require_corridor_intersection=bool(globals().get(
+                "OSM_BUILDING_REQUIRE_CORRIDOR_INTERSECTION",
+                False,
+            )),
             target_alignment_H=fit_H,
             precomputed_raw_target_depth=raw_target_depth,
         )
@@ -4951,6 +6608,7 @@ def _score_candidate_external_building_occlusion(
         ))
         source.update({
             "external_building_occlusion_available": True,
+            "external_building_occlusion_evaluation_failed": False,
             "external_building_occlusion_fraction": fraction,
             "external_building_clear": bool(fraction <= clear_threshold),
             "external_building_occlusion_mask": np.asarray(
@@ -4959,21 +6617,103 @@ def _score_candidate_external_building_occlusion(
             "external_building_target_mask": np.asarray(
                 occlusion["target_mask"], dtype=bool,
             ),
+            # Keep the complete rendered neighbouring-building footprint for
+            # diagnostics.  Candidate preselection refines this into
+            # ``external_building_fit_exclusion_mask`` by retaining pixels
+            # outside the model plus blockers physically in front of it.
+            "external_building_blocker_mask": np.isfinite(
+                np.asarray(occlusion["blocker_depth"], dtype=np.float32)
+            ),
             "external_building_candidate_blockers": list(
                 occlusion["candidate_blocker_mesh_names"]
+            ),
+            "external_building_candidate_blocker_terrain": {
+                name: dict(osm_context.get(
+                    "blocker_terrain_metadata",
+                    {},
+                ).get(name, {}))
+                for name in occlusion["candidate_blocker_mesh_names"]
+            },
+            "external_building_blocker_terrain_source": str(
+                osm_context.get("blocker_terrain_source", "not_available")
             ),
             "external_building_occlusion_reason": (
                 "clear" if fraction <= clear_threshold else "obstructed"
             ),
         })
+        source["_external_building_blocker_depth"] = np.asarray(
+            occlusion["blocker_depth"],
+            dtype=np.float32,
+        )
+        return occlusion
     except Exception as exc:
+        source["external_building_occlusion_evaluation_failed"] = True
         source["external_building_occlusion_reason"] = (
             f"osm_candidate_scoring_failed: {type(exc).__name__}: {exc}"
         )
         print(
             f"[{facade_tag}] candidate {source_index:02d} OSM scoring failed; "
-            f"retaining its depth-global fit ({exc})."
+            f"continuing without an OSM exclusion ({exc})."
         )
+        return None
+
+
+def _assess_target_wall_candidate_visibility(target_wall_guidance):
+    if target_wall_guidance is None:
+        return {
+            "accepted": True,
+            "fallback_used": True,
+            "reason": "target_wall_semantic_guidance_unavailable",
+            "segmentation_available": False,
+        }
+    return assess_prefit_candidate_visibility(
+        target_wall_guidance,
+        minimum_target_projection_pixels=int(globals().get(
+            "MODEL_DEPTH_PREFIT_VISIBILITY_MIN_TARGET_PIXELS",
+            250,
+        )),
+        minimum_target_support_fraction=float(globals().get(
+            "MODEL_DEPTH_PREFIT_VISIBILITY_MIN_TARGET_SUPPORT_FRACTION",
+            0.10,
+        )),
+        maximum_occluder_fraction=float(globals().get(
+            "MODEL_DEPTH_PREFIT_VISIBILITY_MAX_OCCLUDER_FRACTION",
+            0.80,
+        )),
+        low_support_occluder_fraction=float(globals().get(
+            "MODEL_DEPTH_PREFIT_VISIBILITY_LOW_SUPPORT_OCCLUDER_FRACTION",
+            0.60,
+        )),
+        minimum_largest_visible_component_fraction=float(globals().get(
+            "MODEL_DEPTH_PREFIT_VISIBILITY_MIN_LARGEST_COMPONENT_FRACTION",
+            0.05,
+        )),
+        maximum_whole_model_target_area_ratio=float(globals().get(
+            "MODEL_DEPTH_PREFIT_VISIBILITY_MAX_TARGET_AREA_RATIO",
+            6.0,
+        )),
+        reject_when_target_semantics_absent=bool(globals().get(
+            "MODEL_DEPTH_PREFIT_VISIBILITY_REJECT_NO_TARGET",
+            True,
+        )),
+    )
+
+
+def _osm_prefit_hard_rejection(source):
+    """Return a rejection reason only for a nearly fully OSM-hidden wall."""
+    if not bool(source.get("external_building_occlusion_available", False)):
+        return None
+    fraction = float(source.get("external_building_occlusion_fraction", 0.0))
+    threshold = float(globals().get(
+        "OSM_BUILDING_PREFIT_HARD_REJECT_FRACTION",
+        0.97,
+    ))
+    if fraction < threshold:
+        return None
+    return (
+        "osm_nearly_fully_blocks_raw_target_projection: "
+        f"{fraction:.6f} >= {threshold:.6f}"
+    )
 
 
 def _candidate_depth_global_and_osm_preselection(
@@ -4988,19 +6728,29 @@ def _candidate_depth_global_and_osm_preselection(
     osm_context,
     facade_tag,
 ):
-    """Fit and OSM-score every candidate before source ranking."""
+    """OSM-gate, semantically assess, then anchor-fit every candidate."""
     for source_index, source in enumerate(sources):
         source["selection_projection_H"] = np.eye(3, dtype=np.float64)
         source["depth_global_fit_evaluated_before_selection"] = True
         source["depth_global_fit_applied"] = False
         source["depth_global_fit_reason"] = "not_run"
         source["depth_global_score_improvement"] = 0.0
+        source["depth_global_candidate_usable"] = True
+        source["depth_global_candidate_rejection_reason"] = None
+        source["depth_global_target_visibility"] = None
+        source["depth_global_sam3_skipped"] = False
+        source["depth_global_sam3_skip_reason"] = None
         source["external_building_occlusion_available"] = False
+        source["external_building_occlusion_evaluation_failed"] = False
         source["external_building_clear"] = False
         source["external_building_occlusion_reason"] = str(
             osm_context.get("reason", "not_available")
         )
         source["external_building_candidate_blockers"] = []
+        source["external_building_candidate_blocker_terrain"] = {}
+        source["external_building_blocker_terrain_source"] = str(
+            osm_context.get("blocker_terrain_source", "not_available")
+        )
 
         try:
             (
@@ -5072,6 +6822,8 @@ def _candidate_depth_global_and_osm_preselection(
                     "depth_global_fit_applied": False,
                     "depth_global_fit_reason": reason,
                     "depth_global_corrected_wall_outline_px": raw_outline,
+                    "depth_global_candidate_usable": False,
+                    "depth_global_candidate_rejection_reason": reason,
                     "external_building_occlusion_reason": (
                         "skipped_no_visible_wall_projection"
                     ),
@@ -5094,15 +6846,163 @@ def _candidate_depth_global_and_osm_preselection(
             ):
                 raise ValueError("whole model is not visible in the candidate")
 
+            full_projection_mask = (
+                np.isfinite(full_depth) & (full_depth > 0.0)
+            )
+            target_wall_projection_mask = None
+            if target_meshes:
+                raw_target_depth = render_model_depth_map(
+                    target_meshes,
+                    source["K"],
+                    source["Rwc"],
+                    source["C"],
+                    source["img"].size,
+                    near_m=float(globals().get("MODEL_DEPTH_NEAR_M", 0.05)),
+                )
+                target_wall_projection_mask = (
+                    np.isfinite(raw_target_depth)
+                    & (raw_target_depth > 0.0)
+                    & full_projection_mask
+                    & (
+                        np.abs(raw_target_depth - full_depth)
+                        <= float(globals().get(
+                            "FACADE_SOURCE_VISIBILITY_DEPTH_TOLERANCE_M",
+                            0.05,
+                        ))
+                    )
+                )
+                source["depth_global_target_wall_projection_mask"] = (
+                    target_wall_projection_mask.copy()
+                )
+                source["_external_building_raw_target_depth"] = np.where(
+                    target_wall_projection_mask,
+                    raw_target_depth,
+                    np.nan,
+                ).astype(np.float32)
+
+            # OSM must be evaluated in the raw canvas before SAM association or
+            # fitting. The former ordering let the broad "building" prompt and
+            # generic image edges lock onto the very neighbour later removed.
+            raw_osm = _score_candidate_external_building_occlusion(
+                source,
+                target_meshes=target_meshes,
+                target_quads=target_quads,
+                osm_context=osm_context,
+                fit_H=np.eye(3, dtype=np.float64),
+                facade_tag=facade_tag,
+                source_index=source_index,
+            )
+            raw_osm_failure = str(source.get(
+                "external_building_occlusion_reason",
+                "",
+            ))
+            if (
+                raw_osm is None
+                and bool(osm_context.get("available", False))
+                and bool(source.get(
+                    "external_building_occlusion_evaluation_failed",
+                    False,
+                ))
+            ):
+                # Once nearby OSM geometry is available, a per-candidate
+                # render/scoring error is not evidence that the view is clear.
+                # Keeping the old raw-ranking fallback could silently select
+                # exactly the unverified foreground-building case that this
+                # stage is meant to prevent.
+                reason = f"rejected_before_sam3_{raw_osm_failure}"
+                source.update({
+                    "depth_global_fit_result": {
+                        "homography": np.eye(3, dtype=np.float64),
+                        "applied": False,
+                        "reason": reason,
+                    },
+                    "depth_global_full_model_depth": full_depth,
+                    "depth_global_fit_applied": False,
+                    "depth_global_fit_reason": reason,
+                    "depth_global_corrected_wall_outline_px": raw_outline,
+                    "depth_global_candidate_usable": False,
+                    "depth_global_candidate_rejection_reason": reason,
+                    "depth_global_sam3_skipped": True,
+                    "depth_global_sam3_skip_reason": raw_osm_failure,
+                })
+                print(
+                    f"[{facade_tag}] candidate {source_index:02d} rejected "
+                    "before SAM3 because OSM scoring failed"
+                )
+                continue
+            if raw_osm is not None:
+                source.update({
+                    "external_building_raw_projection_occlusion_fraction": float(
+                        source.get("external_building_occlusion_fraction", 0.0)
+                    ),
+                    "external_building_raw_projection_occlusion_mask": np.asarray(
+                        source.get(
+                            "external_building_occlusion_mask",
+                            np.zeros(full_depth.shape, dtype=bool),
+                        ),
+                        dtype=bool,
+                    ).copy(),
+                    "external_building_raw_projection_target_mask": np.asarray(
+                        source.get(
+                            "external_building_target_mask",
+                            np.zeros(full_depth.shape, dtype=bool),
+                        ),
+                        dtype=bool,
+                    ).copy(),
+                })
+            blocker_depth = source.get("_external_building_blocker_depth")
+            osm_blocker_mask = None
+            if blocker_depth is not None:
+                blocker_depth = np.asarray(blocker_depth, dtype=np.float32)
+                depth_tolerance = float(globals().get(
+                    "OSM_BUILDING_DEPTH_TOLERANCE_M",
+                    0.10,
+                ))
+                # Outside the projected model, ignore every visible neighbour;
+                # inside it, exclude only blockers physically in front. This
+                # preserves valid target pixels when an OSM footprint is behind
+                # the target along the same image ray.
+                osm_blocker_mask = np.isfinite(blocker_depth) & (
+                    (~full_projection_mask)
+                    | (blocker_depth + depth_tolerance < full_depth)
+                )
+                source["external_building_fit_exclusion_mask"] = (
+                    osm_blocker_mask.copy()
+                )
+
+            hard_osm_rejection = _osm_prefit_hard_rejection(source)
+            if hard_osm_rejection is not None:
+                reason = f"skipped_before_sam3_{hard_osm_rejection}"
+                source.update({
+                    "depth_global_fit_result": {
+                        "homography": np.eye(3, dtype=np.float64),
+                        "applied": False,
+                        "reason": reason,
+                    },
+                    "depth_global_full_model_depth": full_depth,
+                    "depth_global_fit_applied": False,
+                    "depth_global_fit_reason": reason,
+                    "depth_global_corrected_wall_outline_px": raw_outline,
+                    "depth_global_candidate_usable": False,
+                    "depth_global_candidate_rejection_reason": reason,
+                    "depth_global_sam3_skipped": True,
+                    "depth_global_sam3_skip_reason": hard_osm_rejection,
+                })
+                print(
+                    f"[{facade_tag}] candidate {source_index:02d} rejected before "
+                    f"SAM3 ({hard_osm_rejection})"
+                )
+                continue
+
             prefit_semantic_guidance = None
             try:
                 prefit_semantic_guidance = (
                     _run_model_depth_prefit_semantic_guidance(
                         processor=processor,
                         image_rgb=source["img"],
-                        raw_projection_mask=(
-                            np.isfinite(full_depth) & (full_depth > 0.0)
-                        ),
+                        raw_projection_mask=full_projection_mask,
+                        target_wall_projection_mask=target_wall_projection_mask,
+                        external_exclusion_mask=osm_blocker_mask,
                         stage="candidate_preselection_before_global_depth_fit",
                     )
                 )
@@ -5121,9 +7021,62 @@ def _candidate_depth_global_and_osm_preselection(
                 dict(prefit_semantic_guidance.get("metadata", {}))
                 if prefit_semantic_guidance is not None else None
             )
+            source["depth_global_fit_semantic_guidance"] = (
+                prefit_semantic_guidance
+            )
+            target_wall_guidance = (
+                prefit_semantic_guidance.get("target_wall_guidance")
+                if prefit_semantic_guidance is not None else None
+            )
+            target_visibility = _assess_target_wall_candidate_visibility(
+                target_wall_guidance
+            )
+            source["depth_global_target_visibility"] = target_visibility
+            semantic_fit_anchor_supported = bool(
+                target_visibility.get("segmentation_available", False)
+                and float(target_visibility.get(
+                    "target_support_fraction",
+                    0.0,
+                )) >= float(globals().get(
+                    "MODEL_DEPTH_PREFIT_VISIBILITY_MIN_TARGET_SUPPORT_FRACTION",
+                    0.10,
+                ))
+            )
+            source["depth_global_semantic_fit_anchor_supported"] = (
+                semantic_fit_anchor_supported
+            )
+            source["depth_global_candidate_usable"] = bool(
+                target_visibility.get("accepted", True)
+            )
+            if not source["depth_global_candidate_usable"]:
+                reason = (
+                    "semantic_visibility_rejected_before_fit: "
+                    f"{target_visibility.get('reason', 'unknown')}"
+                )
+                source.update({
+                    "depth_global_fit_result": {
+                        "homography": np.eye(3, dtype=np.float64),
+                        "applied": False,
+                        "reason": reason,
+                    },
+                    "depth_global_full_model_depth": full_depth,
+                    "depth_global_fit_applied": False,
+                    "depth_global_fit_reason": reason,
+                    "depth_global_corrected_wall_outline_px": raw_outline,
+                    "depth_global_candidate_rejection_reason": reason,
+                })
+                print(
+                    f"[{facade_tag}] candidate {source_index:02d} rejected by "
+                    f"target-wall visibility ({target_visibility['reason']})"
+                )
+                continue
             prefit_fit_evidence = _combine_model_depth_fit_evidence(
                 prefit_semantic_guidance,
                 full_depth.shape,
+                external_exclusion_mask=osm_blocker_mask,
+            )
+            source["depth_global_fit_semantic_guidance"] = (
+                prefit_fit_evidence["overlay_guidance"]
             )
 
             semantic_boundary_geometry = None
@@ -5167,15 +7120,18 @@ def _candidate_depth_global_and_osm_preselection(
                         f"{type(exc).__name__}: {exc}"
                     )
 
-            fit_result = fit_depth_silhouette_to_image(
-                image_bgr=cv2.cvtColor(
-                    np.asarray(source["img"].convert("RGB")),
-                    cv2.COLOR_RGB2BGR,
-                ),
+            fit_image_bgr = cv2.cvtColor(
+                np.asarray(source["img"].convert("RGB")),
+                cv2.COLOR_RGB2BGR,
+            )
+            incumbent_fit_config = _model_depth_boundary_fit_config(
+                semantic_target_supported=semantic_fit_anchor_supported,
+            )
+            common_fit_kwargs = dict(
+                image_bgr=fit_image_bgr,
                 full_model_depth=full_depth,
                 raw_wall_outline_px=raw_outline,
                 wall_local_fit_outline_px=raw_outline,
-                fit_config=_model_depth_boundary_fit_config(),
                 minimum_area_px=int(globals().get(
                     "MODEL_DEPTH_BOUNDARY_FIT_MIN_AREA_PX", 350,
                 )),
@@ -5200,6 +7156,10 @@ def _candidate_depth_global_and_osm_preselection(
                         "MODEL_DEPTH_BOUNDARY_BASE_WEIGHT", 0.35,
                     )),
                 },
+            )
+            fit_result = fit_depth_silhouette_to_image(
+                **common_fit_kwargs,
+                fit_config=incumbent_fit_config,
                 valid_image_evidence_mask=prefit_fit_evidence[
                     "valid_evidence_mask"
                 ],
@@ -5210,6 +7170,66 @@ def _candidate_depth_global_and_osm_preselection(
                     "metadata"
                 ],
             )
+            recovery_eligibility = (
+                _background_aware_recovery_eligibility(
+                    prefit_semantic_guidance
+                )
+            )
+            if (
+                semantic_fit_anchor_supported
+                and recovery_eligibility["eligible"]
+            ):
+                background_fit_evidence = _combine_model_depth_fit_evidence(
+                    prefit_semantic_guidance,
+                    full_depth.shape,
+                    external_exclusion_mask=osm_blocker_mask,
+                    background_aware=True,
+                )
+                background_fit_config = _model_depth_boundary_fit_config(
+                    semantic_target_supported=True,
+                    background_aware=True,
+                )
+                background_fit_result = fit_depth_silhouette_to_image(
+                    **common_fit_kwargs,
+                    fit_config=background_fit_config,
+                    valid_image_evidence_mask=background_fit_evidence[
+                        "valid_evidence_mask"
+                    ],
+                    semantic_valid_image_evidence_mask=(
+                        background_fit_evidence[
+                            "semantic_valid_evidence_mask"
+                        ]
+                    ),
+                    semantic_image_boundary_maps=background_fit_evidence[
+                        "boundary_maps"
+                    ],
+                    semantic_image_guidance_metadata=(
+                        background_fit_evidence["metadata"]
+                    ),
+                )
+                fit_result, recovery_decision = (
+                    _choose_background_aware_fit(
+                        fit_result,
+                        background_fit_result,
+                        full_boundary_maps=background_fit_evidence[
+                            "boundary_maps"
+                        ],
+                        image_shape_hw=full_depth.shape,
+                        comparison_config=incumbent_fit_config,
+                        eligibility=recovery_eligibility,
+                    )
+                )
+                if recovery_decision["accepted"]:
+                    prefit_fit_evidence = background_fit_evidence
+                    fit_semantic_guidance = background_fit_evidence[
+                        "overlay_guidance"
+                    ]
+                    source["depth_global_fit_semantic_guidance"] = (
+                        fit_semantic_guidance
+                    )
+                    source["depth_global_fit_semantic_metadata"] = dict(
+                        fit_semantic_guidance.get("metadata", {})
+                    )
             fit_applied = bool(fit_result.get("applied", False))
             fit_H = np.asarray(
                 fit_result.get("homography", np.eye(3)),
@@ -5238,6 +7258,13 @@ def _candidate_depth_global_and_osm_preselection(
                 facade_tag=facade_tag,
                 source_index=source_index,
             )
+
+            fitted_osm_rejection = _osm_prefit_hard_rejection(source)
+            if fitted_osm_rejection is not None:
+                source["depth_global_candidate_usable"] = False
+                source["depth_global_candidate_rejection_reason"] = (
+                    "postfit_" + fitted_osm_rejection
+                )
 
             status = "accepted" if fit_applied else "raw fallback"
             osm_text = (
@@ -5330,16 +7357,14 @@ def _texture_facade_group(group_records,
                           base_z,
                           pano_records,
                           processor,
-                          sam3_prompt_facade,
-                          sam3_prompt_facade_refinement,
-                          sam3_prompt_roof,
                           mesh_by_name,
                           meshes_named=None,
                           model_boundary_edges_xyz=None,
                           osm_occlusion_context=None,
                           stage_timer=None,
                           source_selection_policy="projected_coverage",
-                          camera_elevation_resolver=None):
+                          camera_elevation_resolver=None,
+                          loop_records=None):
     with _timer_stage(stage_timer, f"facade group {group_id:02d} / geometry"):
         geom = _facade_group_geometry(group_records)
     if geom is None:
@@ -5353,9 +7378,14 @@ def _texture_facade_group(group_records,
 
     cid = group_records[0]["component_id"]
     lid = group_records[0]["loop_id"]
+    cid_tag = _artifact_topology_id(cid)
+    lid_tag = _artifact_topology_id(lid)
     first_idx = int(group_records[0]["global_index"])
     last_idx = int(group_records[-1]["global_index"])
-    facade_tag = f"c{cid}_l{lid}_g{group_id:02d}_w{first_idx:02d}-{last_idx:02d}"
+    facade_tag = (
+        f"c{cid_tag}_l{lid_tag}_g{group_id:02d}_"
+        f"w{first_idx:02d}-{last_idx:02d}"
+    )
 
     source_mode = "best_single_native_source_by_target_model_visibility"
     requested_alignment_mode = str(globals().get(
@@ -5481,6 +7511,13 @@ def _texture_facade_group(group_records,
     pitch = float(source_result["pitch"])
     fov_deg = float(source_result["fov"])
     img_rgb = source_result["image"].convert("RGB")
+    selected_sources = list(source_result.get("sources", []))
+    selected_source_index = int(source_result.get("selected_source_index", 0))
+    selected_source = (
+        selected_sources[selected_source_index]
+        if 0 <= selected_source_index < len(selected_sources)
+        else None
+    )
     uv_rect = np.asarray(source_result["uv_rect"], dtype=np.float64)
     uv_outline = np.asarray(source_result["uv_outline"], dtype=np.float64)
     wall_only_uv_rect = uv_rect.copy()
@@ -5624,6 +7661,18 @@ def _texture_facade_group(group_records,
     preselected_full_model_depth = source_result.get(
         "selected_candidate_full_model_depth"
     )
+    selected_full_model_depth_for_sides = None
+    if preselected_full_model_depth is not None:
+        candidate_side_depth = np.asarray(
+            preselected_full_model_depth, dtype=np.float32
+        )
+        selected_raw_shape = (
+            (int(selected_source["img"].height), int(selected_source["img"].width))
+            if selected_source is not None
+            else (int(img_rgb.height), int(img_rgb.width))
+        )
+        if candidate_side_depth.shape == selected_raw_shape:
+            selected_full_model_depth_for_sides = candidate_side_depth.copy()
     depth_boundary_fit_info = {
         "enabled": bool(
             requested_alignment_mode == "depth_global"
@@ -5637,6 +7686,7 @@ def _texture_facade_group(group_records,
     depth_boundary_artifacts = {}
     boundary_meta_path = None
     selected_prefit_semantic_guidance = None
+    selected_fit_semantic_guidance = None
     prefit_semantic_overlay_path = None
     selected_fit_evidence_preview_path = None
 
@@ -5653,7 +7703,8 @@ def _texture_facade_group(group_records,
 
         for src_i, src in enumerate(source_result.get("sources", [])):
             candidate_prefit_guidance = src.get(
-                "depth_global_prefit_semantic_guidance"
+                "depth_global_fit_semantic_guidance",
+                src.get("depth_global_prefit_semantic_guidance"),
             )
             if candidate_prefit_guidance is not None:
                 candidate_semantic_path = Path(
@@ -5669,13 +7720,6 @@ def _texture_facade_group(group_records,
                         create_prefit_semantic_guidance_overlay(
                             np.asarray(src["img"].convert("RGB")),
                             candidate_prefit_guidance,
-                            line_thickness_px=max(
-                                1,
-                                int(globals().get(
-                                    "MODEL_DEPTH_BOUNDARY_OVERLAY_LINE_THICKNESS_PX",
-                                    1,
-                                )),
-                            ),
                         )
                     )
                     Image.fromarray(
@@ -5781,6 +7825,21 @@ def _texture_facade_group(group_records,
             "depth_global_score_improvement": float(
                 s.get("depth_global_score_improvement", 0.0)
             ),
+            "depth_global_candidate_usable": bool(
+                s.get("depth_global_candidate_usable", True)
+            ),
+            "depth_global_candidate_rejection_reason": s.get(
+                "depth_global_candidate_rejection_reason"
+            ),
+            "depth_global_target_visibility": dict(
+                s.get("depth_global_target_visibility") or {}
+            ),
+            "depth_global_sam3_skipped": bool(
+                s.get("depth_global_sam3_skipped", False)
+            ),
+            "depth_global_sam3_skip_reason": s.get(
+                "depth_global_sam3_skip_reason"
+            ),
             "depth_global_prefit_semantic_guidance": (
                 dict(s.get("depth_global_prefit_semantic_metadata") or {})
                 or None
@@ -5810,6 +7869,15 @@ def _texture_facade_group(group_records,
             "external_building_clear": bool(s.get("external_building_clear", False)),
             "external_building_candidate_blockers": list(
                 s.get("external_building_candidate_blockers", [])
+            ),
+            "external_building_candidate_blocker_terrain": dict(
+                s.get("external_building_candidate_blocker_terrain", {})
+            ),
+            "external_building_blocker_terrain_source": str(
+                s.get(
+                    "external_building_blocker_terrain_source",
+                    "not_available",
+                )
             ),
             "external_building_occlusion_reason": str(
                 s.get("external_building_occlusion_reason", "not_evaluated")
@@ -5928,6 +7996,23 @@ def _texture_facade_group(group_records,
                     )
                 if full_depth is None:
                     raise RuntimeError("Whole-model depth rendering returned no image.")
+                # Adjacent-wall visibility is compared in the raw camera
+                # raster.  A depth map rendered through ``depth_H`` is already
+                # in processing-image coordinates and must not be compared to
+                # an adjacent-only raw render.  Keep the known raw candidate
+                # depth above; otherwise let the side helper render raw depth.
+                if (
+                    selected_full_model_depth_for_sides is None
+                    and np.allclose(depth_H, np.eye(3), atol=1.0e-9)
+                    and tuple(full_depth.shape)
+                    == (
+                        int(selected_source["img"].height),
+                        int(selected_source["img"].width),
+                    )
+                ):
+                    selected_full_model_depth_for_sides = np.asarray(
+                        full_depth, dtype=np.float32
+                    ).copy()
 
                 depth_artifacts = _save_model_depth_map_artifacts(
                     per_building_out=per_building_out,
@@ -5954,6 +8039,9 @@ def _texture_facade_group(group_records,
                     cached_prefit_guidance = source_result.get(
                         "selected_candidate_prefit_semantic_guidance"
                     )
+                    cached_fit_guidance = source_result.get(
+                        "selected_candidate_fit_semantic_guidance"
+                    )
                     if (
                         cached_prefit_guidance is None
                         and isinstance(selected_source, dict)
@@ -5961,17 +8049,47 @@ def _texture_facade_group(group_records,
                         cached_prefit_guidance = selected_source.get(
                             "depth_global_prefit_semantic_guidance"
                         )
-                    selected_prefit_semantic_guidance = cached_prefit_guidance
-                    rerun_prefit_semantics = bool(
-                        selected_osm_masked_refit
-                        or cached_prefit_guidance is None
-                    )
-                    if rerun_prefit_semantics:
-                        semantic_stage = (
-                            "selected_source_after_osm_occlusion_before_global_depth_refit"
-                            if selected_osm_masked_refit
-                            else "selected_processing_image_before_global_depth_fit"
+                    if (
+                        cached_fit_guidance is None
+                        and isinstance(selected_source, dict)
+                    ):
+                        cached_fit_guidance = selected_source.get(
+                            "depth_global_fit_semantic_guidance"
                         )
+                    if cached_fit_guidance is None:
+                        cached_fit_guidance = cached_prefit_guidance
+                    selected_prefit_semantic_guidance = cached_prefit_guidance
+                    selected_fit_semantic_guidance = cached_fit_guidance
+                    if cached_prefit_guidance is not None:
+                        cached_shape = np.asarray(
+                            cached_prefit_guidance.get(
+                                "raw_projection_mask",
+                                np.zeros((0, 0), dtype=bool),
+                            ),
+                            dtype=bool,
+                        ).shape
+                        if cached_shape != image_bgr.shape[:2]:
+                            cached_prefit_guidance = None
+                            cached_fit_guidance = None
+                            selected_prefit_semantic_guidance = None
+                            selected_fit_semantic_guidance = None
+                    if cached_fit_guidance is not None:
+                        fit_cached_shape = np.asarray(
+                            cached_fit_guidance.get(
+                                "raw_projection_mask",
+                                np.zeros((0, 0), dtype=bool),
+                            ),
+                            dtype=bool,
+                        ).shape
+                        if fit_cached_shape != image_bgr.shape[:2]:
+                            cached_fit_guidance = None
+                            selected_fit_semantic_guidance = None
+                    if selected_fit_semantic_guidance is None:
+                        selected_fit_semantic_guidance = (
+                            selected_prefit_semantic_guidance
+                        )
+                    rerun_prefit_semantics = cached_prefit_guidance is None
+                    if rerun_prefit_semantics:
                         try:
                             selected_prefit_semantic_guidance = (
                                 _run_model_depth_prefit_semantic_guidance(
@@ -5981,8 +8099,23 @@ def _texture_facade_group(group_records,
                                         np.isfinite(full_depth)
                                         & (full_depth > 0.0)
                                     ),
-                                    stage=semantic_stage,
+                                    target_wall_projection_mask=(
+                                        selected_source.get(
+                                            "depth_global_target_wall_projection_mask"
+                                        )
+                                    ),
+                                    external_exclusion_mask=(
+                                        selected_source.get(
+                                            "external_building_fit_exclusion_mask"
+                                        )
+                                    ),
+                                    stage=(
+                                        "selected_processing_image_before_global_depth_fit"
+                                    ),
                                 )
+                            )
+                            selected_fit_semantic_guidance = (
+                                selected_prefit_semantic_guidance
                             )
                         except Exception as semantic_image_exc:
                             print(
@@ -5992,13 +8125,57 @@ def _texture_facade_group(group_records,
                             selected_prefit_semantic_guidance = (
                                 cached_prefit_guidance
                             )
+                    elif selected_prefit_semantic_guidance is not None:
+                        # The selected image and its pixel coordinates did not
+                        # change. OSM only supplies another evidence mask, so
+                        # reuse the candidate embedding/masks for the refit.
+                        selected_prefit_semantic_guidance = dict(
+                            selected_prefit_semantic_guidance
+                        )
+                        reused_metadata = dict(
+                            selected_prefit_semantic_guidance.get(
+                                "metadata",
+                                {},
+                            )
+                        )
+                        reused_metadata.update({
+                            "reused_from_candidate_preselection": True,
+                            "reused_for_selected_osm_refit": bool(
+                                selected_osm_masked_refit
+                            ),
+                            "selected_source_second_segmentation_run": False,
+                        })
+                        selected_prefit_semantic_guidance["metadata"] = (
+                            reused_metadata
+                        )
+                        if selected_fit_semantic_guidance is None:
+                            selected_fit_semantic_guidance = (
+                                selected_prefit_semantic_guidance
+                            )
+                        elif (
+                            selected_fit_semantic_guidance
+                            is not selected_prefit_semantic_guidance
+                        ):
+                            selected_fit_semantic_guidance = dict(
+                                selected_fit_semantic_guidance
+                            )
                     selected_fit_evidence = (
                         _combine_model_depth_fit_evidence(
-                            selected_prefit_semantic_guidance,
+                            selected_fit_semantic_guidance,
                             image_bgr.shape[:2],
                             external_exclusion_mask=(
                                 selected_external_building_mask
                                 if selected_osm_masked_refit else None
+                            ),
+                            background_aware=bool(
+                                isinstance(
+                                    selected_fit_semantic_guidance,
+                                    Mapping,
+                                )
+                                and selected_fit_semantic_guidance.get(
+                                    "background_aware_active",
+                                    False,
+                                )
                             ),
                         )
                     )
@@ -6059,7 +8236,14 @@ def _texture_facade_group(group_records,
                             full_model_depth=full_depth,
                             raw_wall_outline_px=raw_uv_outline,
                             wall_local_fit_outline_px=wall_only_uv_outline,
-                            fit_config=_model_depth_boundary_fit_config(),
+                            fit_config=_model_depth_boundary_fit_config(
+                                semantic_target_supported=bool(
+                                    selected_source.get(
+                                        "depth_global_semantic_fit_anchor_supported",
+                                        False,
+                                    )
+                                ),
+                            ),
                             minimum_area_px=int(globals().get(
                                 "MODEL_DEPTH_BOUNDARY_FIT_MIN_AREA_PX", 350,
                             )),
@@ -6085,6 +8269,11 @@ def _texture_facade_group(group_records,
                                 )),
                             },
                             valid_image_evidence_mask=valid_image_evidence_mask,
+                            semantic_valid_image_evidence_mask=(
+                                selected_fit_evidence.get(
+                                    "semantic_valid_evidence_mask"
+                                )
+                            ),
                             semantic_image_boundary_maps=selected_fit_evidence[
                                 "boundary_maps"
                             ],
@@ -6156,13 +8345,6 @@ def _texture_facade_group(group_records,
                             create_prefit_semantic_guidance_overlay(
                                 np.asarray(img_rgb.convert("RGB")),
                                 selected_fit_evidence["overlay_guidance"],
-                                line_thickness_px=max(
-                                    1,
-                                    int(globals().get(
-                                        "MODEL_DEPTH_BOUNDARY_OVERLAY_LINE_THICKNESS_PX",
-                                        1,
-                                    )),
-                                ),
                             )
                         )
                         Image.fromarray(
@@ -6209,33 +8391,11 @@ def _texture_facade_group(group_records,
                             boundary_overlay_image_bgr,
                             depth_boundary_fit_result,
                             _model_depth_boundary_fit_config(),
-                            line_thickness_px=int(globals().get(
-                                "MODEL_DEPTH_BOUNDARY_OVERLAY_LINE_THICKNESS_PX", 1,
-                            )),
-                            dash_length_px=float(globals().get(
-                                "MODEL_DEPTH_BOUNDARY_OVERLAY_DASH_LENGTH_PX", 7,
-                            )),
-                            dash_gap_px=float(globals().get(
-                                "MODEL_DEPTH_BOUNDARY_OVERLAY_DASH_GAP_PX", 5,
-                            )),
                         )
                         cv2.imwrite(str(boundary_overlay_path), boundary_overlay)
                         silhouette_shift_overlay = create_depth_silhouette_shift_overlay(
                             depth_boundary_fit_result,
                             _model_depth_boundary_fit_config(),
-                            line_thickness_px=max(
-                                2,
-                                int(globals().get(
-                                    "MODEL_DEPTH_BOUNDARY_OVERLAY_LINE_THICKNESS_PX",
-                                    1,
-                                )),
-                            ),
-                            dash_length_px=float(globals().get(
-                                "MODEL_DEPTH_BOUNDARY_OVERLAY_DASH_LENGTH_PX", 7,
-                            )),
-                            dash_gap_px=float(globals().get(
-                                "MODEL_DEPTH_BOUNDARY_OVERLAY_DASH_GAP_PX", 5,
-                            )),
                         )
                         cv2.imwrite(str(raw_silhouette_path), silhouette_shift_overlay)
 
@@ -6359,103 +8519,88 @@ def _texture_facade_group(group_records,
         save_with_overlay(lr_rgba, uv_outline, lr_overlay_path)
 
     W, H = lr_rgba.size
-    r, g, b, a0 = lr_rgba.split()
-    alpha_np = np.array(a0, dtype=np.uint8)
-    post_rectification_sam_enabled = bool(globals().get(
-        "ENABLE_POST_RECTIFICATION_SAM", True,
+    r, g, b, _lr_alpha = lr_rgba.split()
+    reuse_prefit_semantic_mask_enabled = bool(globals().get(
+        "ENABLE_PREFIT_SEMANTIC_TEXTURE_MASK_REUSE",
+        True,
     ))
-    sam_debug_t0 = time.perf_counter()
-    sam3_instances_overlay_path = None
-    sam3_overlay_path = None
-    refinement_info = {
-        "enabled": post_rectification_sam_enabled,
-        "stage": "after_projection_crop_and_rectification",
-        "accepted_for_refinement": False,
-        "reason": "pending_post_rectification_sam",
-    }
-
-    if post_rectification_sam_enabled:
-        pred_full_clean = np.zeros((H, W), dtype=bool)
-        lr_alpha_gate_info = {
-            "enabled": False,
-            "mode": "projection_polygon_is_authoritative",
-            "reason": "SAM_runs_after_rectification",
-            "selected_px_before_gate": 0,
-            "kept_by_raw_lr_alpha_px": 0,
-            "rescued_selected_px": 0,
-            "removed_selected_px": 0,
-            "wall_margin_px": 0,
-        }
-    else:
-        if CROP_TO_ALPHA_BBOX and (alpha_np.min() < 255):
-            L, Tp, R2, B2 = _lr_model_crop_bbox(alpha_np, uv_outline, W, H)
-            img_for_model = lr_rgba.crop((L, Tp, R2, B2)).convert("RGB")
-            off_x, off_y = L, Tp
-            out_Wm2f, out_Hm2f = R2 - L, B2 - Tp
-        else:
-            img_for_model = lr_rgba.convert("RGB")
-            off_x = off_y = 0
-            out_Wm2f, out_Hm2f = W, H
-
-        uv_outline_model = uv_outline - np.array([off_x, off_y], dtype=np.float64)
-        with _timer_stage(stage_timer, f"{facade_tag} / legacy perspective SAM3 prompts"):
-            with torch.no_grad():
-                state = processor.set_image(img_for_model)
-                out_facade = processor.set_text_prompt(state=state, prompt=sam3_prompt_facade)
-                facade_stack = _extract_mask_stack(out_facade, out_Hm2f, out_Wm2f)
-                out_roof = processor.set_text_prompt(state=state, prompt=sam3_prompt_roof)
-                roof_stack = _extract_mask_stack(out_roof, out_Hm2f, out_Wm2f)
-                roof_mask = _stack_union(roof_stack, out_Hm2f, out_Wm2f)
-                if ROOF_SUBTRACT_DILATE_PX and ROOF_SUBTRACT_DILATE_PX > 0:
-                    k = int(ROOF_SUBTRACT_DILATE_PX)
-                    kernel = np.ones((2 * k + 1, 2 * k + 1), dtype=np.uint8)
-                    roof_mask = cv2.dilate(
-                        roof_mask.astype(np.uint8) * 255, kernel, iterations=1,
-                    ) > 0
-                building_mask, selected_idxs, facade_scores, debug_facade_stack, refinement_info = (
-                    _select_facade_mask_with_optional_refinement(
-                        processor=processor,
-                        state=state,
-                        facade_stack=facade_stack,
-                        roof_mask=roof_mask,
-                        wall_poly_xy=uv_outline_model,
-                        H=out_Hm2f,
-                        W=out_Wm2f,
-                        primary_prompt=sam3_prompt_facade,
-                        refinement_prompt=sam3_prompt_facade_refinement,
-                    )
+    semantic_target_projection_mask = _polygon_to_mask(
+        H, W, uv_outline
+    )
+    if (
+        selected_prefit_semantic_guidance is None
+        and (
+            reuse_prefit_semantic_mask_enabled
+            or bool(globals().get(
+                "ENABLE_FACADE_SIDE_SEMANTIC_RECOVERY", True,
+            ))
+        )
+    ):
+        try:
+            selected_prefit_semantic_guidance = (
+                _run_model_depth_prefit_semantic_guidance(
+                    processor=processor,
+                    image_rgb=img_rgb,
+                    raw_projection_mask=semantic_target_projection_mask,
+                    target_wall_projection_mask=(
+                        semantic_target_projection_mask
+                    ),
+                    external_exclusion_mask=(
+                        selected_external_building_mask
+                    ),
+                    stage=(
+                        "selected_source_for_facade_side_and_texture_semantics"
+                    ),
                 )
-
-        sam3_instances_overlay_path = Path(
-            per_building_out,
-            f"{geojson_base}__{facade_tag}__legacy_perspective_sam3_instances_overlay.png",
+            )
+            selected_fit_semantic_guidance = (
+                selected_prefit_semantic_guidance
+            )
+        except Exception as semantic_side_exc:
+            print(
+                f"[{facade_tag}] selected facade-side semantic guidance "
+                f"unavailable ({semantic_side_exc})."
+            )
+    semantic_reuse_t0 = time.perf_counter()
+    semantic_reuse_overlay_path = None
+    refinement_info = {
+        "enabled": reuse_prefit_semantic_mask_enabled,
+        "stage": "selected_source_full_image_before_global_depth_fit",
+        "accepted_for_reuse": False,
+        "reason": "pending_prefit_semantic_mask_reuse",
+        "second_segmentation_inference_run": False,
+    }
+    pred_full_clean = np.zeros((H, W), dtype=bool)
+    if selected_prefit_semantic_guidance is not None:
+        selected_target = selected_prefit_semantic_guidance.get(
+            "target_semantic_mask"
         )
-        save_sam3_instance_debug_overlay(
-            base_img_pil=img_for_model,
-            facade_stack=debug_facade_stack,
-            roof_mask=roof_mask,
-            selected_idx=selected_idxs,
-            facade_scores=facade_scores,
-            out_path=str(sam3_instances_overlay_path),
-        )
-        pred_full_raw = np.zeros((H, W), dtype=bool)
-        pred_full_raw[off_y:off_y + out_Hm2f, off_x:off_x + out_Wm2f] = building_mask
-        pred_full_raw, lr_alpha_gate_info = _apply_lr_alpha_gate_to_selected_mask(
-            pred_full_raw, alpha_np, uv_outline,
-        )
-    if not post_rectification_sam_enabled:
-        pred_full_clean = clean_selected_mask(pred_full_raw)
+        if selected_target is not None:
+            selected_target = np.asarray(selected_target, dtype=bool)
+            if selected_target.shape == (H, W):
+                pred_full_clean = selected_target.copy()
+    lr_alpha_gate_info = {
+        "enabled": False,
+        "mode": "full_canvas_prefit_semantic_mask_reuse",
+        "reason": "no_secondary_crop_or_segmentation",
+        "selected_px_before_gate": int(pred_full_clean.sum()),
+        "kept_by_raw_lr_alpha_px": int(pred_full_clean.sum()),
+        "rescued_selected_px": 0,
+        "removed_selected_px": 0,
+        "wall_margin_px": 0,
+    }
     depth_aware_region_fit_result = None
     legacy_region_fit_requested = bool(globals().get("ENABLE_DEPTH_AWARE_REGION_FIT", False))
     depth_aware_region_fit_info = {
-        "enabled": legacy_region_fit_requested and not post_rectification_sam_enabled,
+        "enabled": legacy_region_fit_requested and bool(pred_full_clean.any()),
         "applied": False,
         "reason": (
-            "disabled_by_projection_first_pipeline"
-            if legacy_region_fit_requested and post_rectification_sam_enabled
+            "no_reused_prefit_target_mask"
+            if legacy_region_fit_requested and not pred_full_clean.any()
             else "disabled"
         ),
         "segmentation_search_buffer_px": int(segmentation_search_buffer_px),
+        "segmentation_source": "reused_full_image_prefit_semantics",
     }
     depth_aware_region_fit_overlay_path = Path(
         per_building_out,
@@ -6573,7 +8718,7 @@ def _texture_facade_group(group_records,
             )
             final_depth_camera_metadata = dict(depth_fit_context["camera_metadata"])
             final_depth_camera_metadata.update({
-                "post_segmentation_region_fit": depth_aware_region_fit_info,
+                "prefit_semantic_region_fit": depth_aware_region_fit_info,
                 "depth_value_note": (
                     "Camera-forward metric depth from the anchor camera; the accepted "
                     "region correction moves the entire connected model in image space."
@@ -6597,25 +8742,210 @@ def _texture_facade_group(group_records,
         except Exception as exc:
             print(f"[{facade_tag}] final region-refined model depth save failed: {exc}")
 
-    projection_mask_full = _polygon_to_mask(H, W, uv_outline)
-    if post_rectification_sam_enabled:
-        if not projection_mask_full.any():
-            print(f"[{facade_tag}] Selected wall projection is empty on the source image.")
-            return {}
-        retained_source_mask, external_mask_inside_projection = (
-            _remove_external_building_pixels(
-                projection_mask_full,
-                selected_external_building_mask,
+    source_side_evidence = {
+        "enabled": False,
+        "reason": "disabled",
+        "sides": {},
+        "content_extension_mask": np.zeros((H, W), dtype=bool),
+    }
+    if bool(globals().get("ENABLE_FACADE_SIDE_SEMANTIC_RECOVERY", True)):
+        try:
+            if selected_source is None:
+                raise ValueError("selected_source_geometry_unavailable")
+            if effective_alignment_mode == "depth_global":
+                base_model_to_selected_h = np.asarray(
+                    facade_alignment_selection.get("homography", np.eye(3)),
+                    dtype=np.float64,
+                )
+            else:
+                base_model_to_selected_h = np.asarray(
+                    source_result.get(
+                        "selected_source_raw_to_aligned_image_H",
+                        np.eye(3),
+                    ),
+                    dtype=np.float64,
+                )
+            model_to_selected_h = (
+                np.asarray(region_fit_H, dtype=np.float64)
+                @ base_model_to_selected_h
             )
-        )
-    else:
-        retained_source_mask, external_mask_inside_projection = (
-            _remove_external_building_pixels(
-                pred_full_clean,
-                selected_external_building_mask,
+            adjacent_contexts = build_adjacent_wall_contexts(
+                group_records=group_records,
+                loop_records=list(loop_records or []),
+                mesh_by_name=mesh_by_name,
+                meshes_named=list(meshes_named or []),
+                K=np.asarray(selected_source["K"], dtype=np.float64),
+                R_wc=np.asarray(selected_source["Rwc"], dtype=np.float64),
+                camera_xyz=np.asarray(selected_source["C"], dtype=np.float64),
+                raw_image_size_wh=selected_source["img"].size,
+                selected_image_size_wh=img_rgb.size,
+                model_to_selected_h=model_to_selected_h,
+                raw_full_depth=selected_full_model_depth_for_sides,
+                side_band_px=int(globals().get(
+                    "FACADE_SIDE_SOURCE_BAND_PX", 48,
+                )),
+                minimum_visible_fraction=float(globals().get(
+                    "FACADE_SIDE_MIN_ADJACENT_VISIBLE_FRACTION", 0.08,
+                )),
             )
-        )
-    alpha_build = retained_source_mask.astype(np.uint8) * 255
+            source_side_evidence = analyze_source_side_evidence(
+                target_outline_px=uv_outline,
+                semantic_guidance=selected_prefit_semantic_guidance,
+                adjacent_contexts=adjacent_contexts,
+                image_shape_hw=(H, W),
+                external_exclusion_mask=selected_external_building_mask,
+                side_band_px=int(globals().get(
+                    "FACADE_SIDE_SOURCE_BAND_PX", 48,
+                )),
+                foreground_occlusion_ratio=float(globals().get(
+                    "FACADE_SIDE_FOREGROUND_OCCLUSION_RATIO", 0.50,
+                )),
+            )
+        except Exception as side_exc:
+            source_side_evidence = {
+                "enabled": False,
+                "reason": f"side_evidence_failed: {side_exc}",
+                "sides": {},
+                "content_extension_mask": np.zeros((H, W), dtype=bool),
+            }
+            print(f"[{facade_tag}] source side-evidence analysis failed: {side_exc}")
+
+    opening_sam_rows = []
+    opening_sam_info = {
+        "enabled": bool(globals().get(
+            "ENABLE_OPENING_AWARE_RECTIFICATION", True,
+        )),
+        "reason": "disabled",
+        "raw_instance_count": 0,
+    }
+    if opening_sam_info["enabled"]:
+        try:
+            opening_sam_rows, opening_runtime = run_opening_sam3_prompts(
+                processor,
+                img_rgb,
+                globals().get(
+                    "OPENING_AWARE_PROMPT_LIBRARY",
+                    {
+                        "window": (
+                            "window", "building window", "shop window",
+                        ),
+                        "door": ("door", "building entrance door"),
+                    },
+                ),
+                proposal_threshold=float(globals().get(
+                    "OPENING_AWARE_PROPOSAL_THRESHOLD", 0.20,
+                )),
+            )
+            opening_sam_info = {
+                "enabled": True,
+                "reason": "completed",
+                **opening_runtime,
+            }
+        except Exception as opening_exc:
+            opening_sam_info = {
+                "enabled": True,
+                "reason": f"opening_sam3_failed: {opening_exc}",
+                "raw_instance_count": 0,
+            }
+            print(f"[{facade_tag}] SAM3 opening detection failed: {opening_exc}")
+
+    projection_mask_full = semantic_target_projection_mask
+    if not projection_mask_full.any():
+        print(f"[{facade_tag}] Selected wall projection is empty on the source image.")
+        return {}
+    semantic_reuse_result = build_reused_prefit_facade_mask(
+        selected_prefit_semantic_guidance,
+        projection_mask_full,
+        external_exclusion_mask=selected_external_building_mask,
+        enabled=reuse_prefit_semantic_mask_enabled,
+        minimum_pixels=int(globals().get(
+            "PREFIT_SEMANTIC_TEXTURE_MIN_PIXELS",
+            250,
+        )),
+        minimum_wall_coverage=float(globals().get(
+            "PREFIT_SEMANTIC_TEXTURE_MIN_WALL_COVERAGE",
+            0.35,
+        )),
+        closing_radius_px=int(globals().get(
+            "PREFIT_SEMANTIC_TEXTURE_CLOSE_PX",
+            2,
+        )),
+        maximum_hole_area_px=int(globals().get(
+            "PREFIT_SEMANTIC_TEXTURE_MAX_HOLE_AREA_PX",
+            900,
+        )),
+        maximum_hard_exclusion_fraction=float(globals().get(
+            "PREFIT_SEMANTIC_TEXTURE_MAX_HARD_EXCLUSION_FRACTION",
+            0.85,
+        )),
+    )
+    retained_source_mask = np.asarray(
+        semantic_reuse_result["effective_content_mask"],
+        dtype=bool,
+    )
+    semantic_source_candidate_mask = np.asarray(
+        semantic_reuse_result["semantic_candidate_mask"],
+        dtype=bool,
+    )
+    semantic_source_exclusion_mask = np.asarray(
+        semantic_reuse_result["excluded_inside_projection_mask"],
+        dtype=bool,
+    )
+    semantic_source_roof_mask = np.asarray(
+        semantic_reuse_result["selected_roof_mask"],
+        dtype=bool,
+    )
+    side_content_extension = np.asarray(
+        source_side_evidence.get(
+            "content_extension_mask", np.zeros((H, W), dtype=bool),
+        ),
+        dtype=bool,
+    )
+    if side_content_extension.shape != (H, W):
+        side_content_extension = np.zeros((H, W), dtype=bool)
+    # Potential outside content is present only on the Hough inspection
+    # canvas.  It is not promoted to retained facade content unless that
+    # specific side later selects a validated outside edge.
+    side_detection_source_mask = retained_source_mask | side_content_extension
+    refinement_info = {
+        key: value
+        for key, value in semantic_reuse_result.items()
+        if key not in {
+            "semantic_candidate_mask",
+            "hard_occluder_mask",
+            "generic_non_target_mask",
+            "effective_content_mask",
+            "excluded_inside_projection_mask",
+            "selected_roof_mask",
+        }
+    }
+    refinement_info.update({
+        "accepted_for_reuse": bool(semantic_reuse_result["accepted"]),
+        "source_stage": "full_image_prefit_semantics_used_for_global_depth_fit",
+        "downstream_stage": "source_crop_then_rectification_and_hough",
+        "facade_side_evidence": side_evidence_metadata(
+            source_side_evidence
+        ),
+        "opening_sam3": opening_sam_info,
+        "side_content_extension_candidate_pixels": int(
+            side_content_extension.sum()
+        ),
+    })
+    _, external_mask_inside_projection = _remove_external_building_pixels(
+        projection_mask_full,
+        selected_external_building_mask,
+    )
+    status = (
+        "accepted"
+        if refinement_info["accepted_for_reuse"]
+        else "fitted-projection fallback"
+    )
+    print(
+        f"[{facade_tag}] reused pre-fit semantic facade mask {status} | "
+        f"reason={refinement_info.get('reason')} | "
+        f"coverage={float(refinement_info.get('candidate_wall_coverage', 0.0)):.3f}"
+    )
+    alpha_build = side_detection_source_mask.astype(np.uint8) * 255
     external_building_occlusion_info["removed_inside_projection_pixel_count"] = int(
         external_mask_inside_projection.sum()
     )
@@ -6626,20 +8956,10 @@ def _texture_facade_group(group_records,
         f"{geojson_base}__{facade_tag}__projection_cropped_facade.png",
     )
     rgba_full.save(projection_crop_path)
-    if not post_rectification_sam_enabled:
-        sam3_overlay_path = Path(
-            per_building_out,
-            f"{geojson_base}__{facade_tag}__legacy_perspective_sam3_overlay.png",
-        )
-        save_with_overlay(rgba_full, uv_outline, str(sam3_overlay_path))
     if stage_timer is not None:
         stage_timer.record(
-            (
-                f"{facade_tag} / save projection-cropped facade"
-                if post_rectification_sam_enabled
-                else f"{facade_tag} / save legacy perspective SAM debug overlays"
-            ),
-            time.perf_counter() - sam_debug_t0,
+            f"{facade_tag} / crop using reused prefit semantic evidence",
+            time.perf_counter() - semantic_reuse_t0,
         )
 
     with _timer_stage(stage_timer, f"{facade_tag} / orthorectify"):
@@ -6651,14 +8971,7 @@ def _texture_facade_group(group_records,
             print(f"[{facade_tag}] Empty alpha before orthorectification - falling back to per-fragment texturing.")
             return {}
 
-        ys, xs = np.where(a2 > 0)
-        contour_px = np.stack([xs, ys], axis=1).astype(np.float64)
-        contour_m = apply_H(contour_px, H_pix_to_wall_m)
-        contour_m = contour_m[np.isfinite(contour_m).all(axis=1)]
-        if contour_m.shape[0] > 0 and not post_rectification_sam_enabled:
-            target_m = np.vstack([outline_m, rect_m, contour_m]).astype(np.float64)
-        else:
-            target_m = np.vstack([outline_m, rect_m]).astype(np.float64)
+        target_m = np.vstack([outline_m, rect_m]).astype(np.float64)
 
         xmin = float(target_m[:, 0].min()) - MARGIN_METERS
         ymin = float(target_m[:, 1].min()) - MARGIN_METERS
@@ -6700,8 +9013,59 @@ def _texture_facade_group(group_records,
         rectified_wall_mask = build_wall_region_mask(
             out_Hr, out_Wr, wall_poly_px,
         ) > 0
-        ortho_rgba[~rectified_wall_mask, :3] = 0
-        ortho_rgba[~rectified_wall_mask, 3] = 0
+        rectified_semantic_content_mask = cv2.warpPerspective(
+            retained_source_mask.astype(np.uint8) * 255,
+            H_pix_to_ortho_px,
+            (out_Wr, out_Hr),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        ) > 0
+        rectified_semantic_candidate_mask = cv2.warpPerspective(
+            semantic_source_candidate_mask.astype(np.uint8) * 255,
+            H_pix_to_ortho_px,
+            (out_Wr, out_Hr),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        ) > 0
+        rectified_semantic_exclusion_mask = cv2.warpPerspective(
+            semantic_source_exclusion_mask.astype(np.uint8) * 255,
+            H_pix_to_ortho_px,
+            (out_Wr, out_Hr),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        ) > 0
+        rectified_semantic_roof_mask = cv2.warpPerspective(
+            semantic_source_roof_mask.astype(np.uint8) * 255,
+            H_pix_to_ortho_px,
+            (out_Wr, out_Hr),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        ) > 0
+        # Keep the narrow, side-specific semantic recovery strip until the
+        # accepted side/opening warp has been applied.  Clipping here used to
+        # destroy a real wall edge whenever it lay just outside the projected
+        # target and inside a visible adjacent-wall projection.
+        rectified_side_evidence = warp_side_evidence_to_rectified(
+            source_side_evidence,
+            H_pix_to_ortho_px,
+            (out_Hr, out_Wr),
+        )
+        rectified_side_detection_mask = cv2.warpPerspective(
+            side_detection_source_mask.astype(np.uint8) * 255,
+            H_pix_to_ortho_px,
+            (out_Wr, out_Hr),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        ) > 0
+        ortho_rgba[~rectified_side_detection_mask, :3] = 0
+        ortho_rgba[:, :, 3] = (
+            rectified_side_detection_mask.astype(np.uint8) * 255
+        )
 
     ortho_prefit_overlay_path = Path(per_building_out) / f"{geojson_base}__{facade_tag}__ortho_prefit_overlay.png"
     if SAVE_FACADE_GROUP_DEBUG_PNG or SAVE_ARTIFACT_CONTACT_SHEET:
@@ -6711,8 +9075,18 @@ def _texture_facade_group(group_records,
             str(ortho_prefit_overlay_path)
         )
 
-    with _timer_stage(stage_timer, f"{facade_tag} / Hough adjustment before SAM"):
-        ortho_rgba, hough_info, hough_overlay_path, hough_warp_overlay_path, hough_band_paths = _apply_group_hough_adjustment(
+    with _timer_stage(
+        stage_timer,
+        f"{facade_tag} / Hough adjustment with semantic-mask propagation",
+    ):
+        (
+            ortho_rgba,
+            hough_info,
+            hough_overlay_path,
+            hough_warp_overlay_path,
+            hough_band_paths,
+            hough_auxiliary_masks,
+        ) = _apply_group_hough_adjustment(
             ortho_rgba=ortho_rgba,
             wall_poly_px=wall_poly_px,
             rect_poly_px=rect_poly_px,
@@ -6721,130 +9095,215 @@ def _texture_facade_group(group_records,
             facade_tag=facade_tag,
             edge_mask_override=None,
             allow_guided_warp=True,
+            auxiliary_masks={
+                "semantic_content": rectified_semantic_content_mask,
+                "semantic_candidate": rectified_semantic_candidate_mask,
+                "semantic_exclusion": rectified_semantic_exclusion_mask,
+                "semantic_roof": rectified_semantic_roof_mask,
+            },
+            side_evidence=rectified_side_evidence,
+            opening_context={
+                "source_rows": opening_sam_rows,
+                "source_wall_mask": projection_mask_full,
+                "source_exclusion_mask": (
+                    semantic_source_exclusion_mask
+                    | semantic_source_roof_mask
+                    | np.asarray(
+                        source_side_evidence.get(
+                            "foreground_mask",
+                            np.zeros((H, W), dtype=bool),
+                        ),
+                        dtype=bool,
+                    )
+                ),
+                "source_to_rectified_h": H_pix_to_ortho_px,
+                "source_rgba": rgba_for_rectify,
+                "source_side_extensions": {
+                    str(side): np.asarray(
+                        row.get(
+                            "candidate_extension_mask",
+                            np.zeros((H, W), dtype=bool),
+                        ),
+                        dtype=bool,
+                    )
+                    for side, row in dict(
+                        source_side_evidence.get("sides") or {}
+                    ).items()
+                },
+                "source_masks": {
+                    "semantic_content": retained_source_mask,
+                    "semantic_candidate": semantic_source_candidate_mask,
+                    "semantic_exclusion": semantic_source_exclusion_mask,
+                    "semantic_roof": semantic_source_roof_mask,
+                },
+            },
         )
+    reused_rectified_mask = np.asarray(
+        hough_auxiliary_masks["semantic_content"],
+        dtype=bool,
+    ) & rectified_wall_mask
+    reused_rectified_candidate_mask = np.asarray(
+        hough_auxiliary_masks["semantic_candidate"],
+        dtype=bool,
+    ) & rectified_wall_mask
+    reused_rectified_exclusion_mask = np.asarray(
+        hough_auxiliary_masks["semantic_exclusion"],
+        dtype=bool,
+    ) & rectified_wall_mask
+    reused_rectified_roof_mask = np.asarray(
+        hough_auxiliary_masks["semantic_roof"],
+        dtype=bool,
+    ) & rectified_wall_mask
+
+    roof_structure_result = build_post_hough_roof_structure_removal(
+        rectified_wall_mask,
+        reused_rectified_roof_mask,
+        enabled=bool(globals().get(
+            "ENABLE_POST_HOUGH_ROOF_STRUCTURE_REMOVAL",
+            True,
+        )),
+        connection_tolerance_px=int(globals().get(
+            "POST_HOUGH_ROOF_CONNECTION_TOLERANCE_PX",
+            3,
+        )),
+        boundary_seed_px=int(globals().get(
+            "POST_HOUGH_ROOF_BOUNDARY_SEED_PX",
+            2,
+        )),
+        minimum_divider_component_area_px=int(globals().get(
+            "POST_HOUGH_ROOF_MIN_DIVIDER_COMPONENT_AREA_PX",
+            32,
+        )),
+        minimum_partition_area_px=int(globals().get(
+            "POST_HOUGH_ROOF_MIN_PARTITION_AREA_PX",
+            80,
+        )),
+        minimum_partition_fraction=float(globals().get(
+            "POST_HOUGH_ROOF_MIN_PARTITION_FRACTION",
+            0.03,
+        )),
+    )
+    roof_structure_removal_mask = np.asarray(
+        roof_structure_result["removal_mask"],
+        dtype=bool,
+    )
+    reused_rectified_mask &= ~roof_structure_removal_mask
+    reused_rectified_candidate_mask &= ~roof_structure_removal_mask
+    reused_rectified_exclusion_mask |= roof_structure_removal_mask
+    roof_structure_info = {
+        key: value
+        for key, value in roof_structure_result.items()
+        if key not in {
+            "roof_mask",
+            "below_roof_mask",
+            "removal_mask",
+        }
+    }
+    refinement_info["post_hough_roof_structure_removal"] = (
+        roof_structure_info
+    )
+    if int(roof_structure_info.get("roof_pixels", 0)) > 0:
+        print(
+            f"[{facade_tag}] post-Hough roof removal | "
+            f"roof components={roof_structure_info['roof_component_count']} | "
+            f"dividers={roof_structure_info['divider_component_count']} | "
+            f"removed={roof_structure_info['removed_pixels']}px"
+        )
+    ortho_rgba[~reused_rectified_mask, :3] = 0
+    ortho_rgba[:, :, 3] = reused_rectified_mask.astype(np.uint8) * 255
     ortho_rgba[~rectified_wall_mask, :3] = 0
     ortho_rgba[~rectified_wall_mask, 3] = 0
 
-    post_sam_result = None
-    post_sam_refinement_accepted = False
-    post_sam_refinement_mask = ortho_rgba[:, :, 3] > 0
-    post_sam_selected_mask = post_sam_refinement_mask.copy()
-    if post_rectification_sam_enabled:
-        sam_debug_t0 = time.perf_counter()
-        rectified_projection_mask = (
-            rectified_wall_mask & (ortho_rgba[:, :, 3] > 0)
-        )
-        with _timer_stage(stage_timer, f"{facade_tag} / bounded post-rectification SAM3"):
-            post_sam_result = _run_post_rectification_sam(
-                processor=processor,
-                ortho_rgba=ortho_rgba,
-                allowed_wall_mask=rectified_projection_mask,
-                wall_poly_px=wall_poly_px,
-                primary_prompt=sam3_prompt_facade,
-                refinement_prompt=sam3_prompt_facade_refinement,
-                roof_prompt=sam3_prompt_roof,
-            )
-        refinement_info = post_sam_result["info"]
-        refinement_info["input_stage"] = "after_bounded_hough_adjustment"
-        refinement_info["hough_warp_applied_before_sam"] = bool(
+    refinement_info.update({
+        "rectified_content_pixels_after_hough": int(
+            reused_rectified_mask.sum()
+        ),
+        "rectified_candidate_pixels_after_hough": int(
+            reused_rectified_candidate_mask.sum()
+        ),
+        "rectified_exclusion_pixels_after_hough": int(
+            reused_rectified_exclusion_mask.sum()
+        ),
+        "rectified_roof_evidence_pixels_after_hough": int(
+            reused_rectified_roof_mask.sum()
+        ),
+        "hough_warp_applied_to_rgb_and_semantic_mask": bool(
             hough_info.get("guided_warp_applied", False)
-        )
-        post_sam_refinement_accepted = bool(
-            refinement_info.get("accepted_for_refinement", False)
-        )
-        post_sam_refinement_mask = np.asarray(
-            post_sam_result["effective_refinement_mask"], dtype=bool,
-        )
-        post_sam_selected_mask = np.asarray(
-            post_sam_result["clipped_sam_mask"], dtype=bool,
+        ),
+        "semantic_mask_interpolation": "nearest",
+        "second_facade_segmentation_inference_run": False,
+        "opening_segmentation_inference_run": bool(
+            opening_sam_info.get("reason") == "completed"
+        ),
+        "side_content_extension_accepted_pixels": int(
+            hough_info.get("accepted_side_extension_pixels", 0)
+        ),
+        "side_content_extension_accepted_sides": list(
+            hough_info.get("accepted_side_extension_sides", [])
+        ),
+    })
+    semantic_reuse_overlay_path = Path(
+        per_building_out,
+        (
+            f"{geojson_base}__{facade_tag}"
+            "__reused_prefit_semantic_mask_after_hough.png"
+        ),
+    )
+    if (
+        bool(globals().get(
+            "SAVE_PREFIT_SEMANTIC_TEXTURE_REUSE_DEBUG",
+            True,
+        ))
+        or SAVE_ARTIFACT_CONTACT_SHEET
+    ):
+        _save_reused_prefit_semantic_overlay(
+            img_rgba=ortho_rgba,
+            wall_poly_px=wall_poly_px,
+            content_mask=reused_rectified_mask,
+            exclusion_mask=(
+                rectified_wall_mask & (~reused_rectified_mask)
+            ),
+            out_path=str(semantic_reuse_overlay_path),
+            reuse_info=refinement_info,
         )
 
-        sam3_instances_overlay_path = Path(
-            per_building_out,
-            f"{geojson_base}__{facade_tag}__post_rectification_sam3_instances_overlay.png",
-        )
-        model_image = post_sam_result.get("model_image")
-        debug_stack = np.asarray(post_sam_result.get("facade_stack"), dtype=bool)
-        debug_roof = np.asarray(post_sam_result.get("roof_mask"), dtype=bool)
-        if (
-            model_image is not None
-            and debug_stack.ndim == 3
-            and debug_stack.shape[1:] == (model_image.height, model_image.width)
-            and debug_roof.shape == (model_image.height, model_image.width)
-        ):
-            save_sam3_instance_debug_overlay(
-                base_img_pil=model_image,
-                facade_stack=debug_stack,
-                roof_mask=debug_roof,
-                selected_idx=post_sam_result.get("selected_indices", []),
-                facade_scores=post_sam_result.get("scores", []),
-                out_path=str(sam3_instances_overlay_path),
-            )
-
-        status = "accepted" if post_sam_refinement_accepted else "projection fallback"
-        print(
-            f"[{facade_tag}] post-rectification SAM {status} | "
-            f"reason={refinement_info.get('reason')} | "
-            f"selected={post_sam_result.get('selected_indices', [])}"
-        )
-        for row in post_sam_result.get("scores", []):
-            i, score, area, inter, outside, center_dist = row
-            print(
-                f"    rectified facade[{i}] score={score:.4f} area={area} "
-                f"inter={inter} outside={outside} center_dist={center_dist:.4f}"
-            )
-        if stage_timer is not None:
-            stage_timer.record(
-                f"{facade_tag} / save post-rectification SAM debug overlays",
-                time.perf_counter() - sam_debug_t0,
-            )
-
-    if post_rectification_sam_enabled:
-        sam3_overlay_path = Path(
-            per_building_out,
-            f"{geojson_base}__{facade_tag}__post_rectification_sam3_overlay.png",
-        )
-        ortho_fit_overlay_path = sam3_overlay_path
-    else:
-        ortho_fit_overlay_path = Path(
-            per_building_out,
-            f"{geojson_base}__{facade_tag}__ortho_fit_overlay.png",
-        )
-    ortho_fit_source_mask = np.asarray(
-        post_sam_selected_mask
-        if post_rectification_sam_enabled
-        else (ortho_rgba[:, :, 3] > 0),
-        dtype=bool,
-    ).copy()
+    ortho_fit_overlay_path = Path(
+        per_building_out,
+        f"{geojson_base}__{facade_tag}__ortho_fit_overlay.png",
+    )
+    ortho_fit_source_mask = reused_rectified_mask.copy()
     with _timer_stage(stage_timer, f"{facade_tag} / ortho fit"):
-        if post_rectification_sam_enabled and not post_sam_refinement_accepted:
+        if (
+            reuse_prefit_semantic_mask_enabled
+            and not bool(refinement_info.get("accepted_for_reuse", False))
+        ):
             M_ortho_fit = None
             ortho_fit_source_pts = None
             ortho_fit_fitted_pts = None
             ortho_fit_info = {
                 "enabled": bool(_ortho_fit_enabled()),
                 "applied": False,
-                "fit_mode": "bounded_post_rectification_sam_refinement",
-                "reason": "sam_not_accepted_projection_texture_unchanged",
-                "source_area_px": int(post_sam_refinement_mask.sum()),
+                "fit_mode": "reused_prefit_semantic_mask_refinement",
+                "reason": (
+                    "prefit_semantic_target_not_accepted_"
+                    "projection_fallback_unchanged"
+                ),
+                "source_area_px": int(reused_rectified_mask.sum()),
                 "target_area_px": int(rectified_wall_mask.sum()),
             }
         else:
             ortho_rgba, M_ortho_fit, ortho_fit_source_pts, ortho_fit_fitted_pts, ortho_fit_info = _fit_ortho_rgba_alpha_inside_polygon(
                 ortho_rgba,
                 wall_poly_px,
-                source_mask_override=(
-                    post_sam_refinement_mask
-                    if post_rectification_sam_enabled else None
-                ),
-                max_scale_delta=(
-                    float(globals().get("POST_RECTIFICATION_SAM_MAX_SCALE_DELTA", 0.08))
-                    if post_rectification_sam_enabled else None
-                ),
-                max_translation_px=(
-                    float(globals().get("POST_RECTIFICATION_SAM_MAX_TRANSLATION_PX", 30.0))
-                    if post_rectification_sam_enabled else None
-                ),
+                source_mask_override=reused_rectified_mask,
+                max_scale_delta=float(globals().get(
+                    "PREFIT_SEMANTIC_TEXTURE_MAX_SCALE_DELTA",
+                    0.08,
+                )),
+                max_translation_px=float(globals().get(
+                    "PREFIT_SEMANTIC_TEXTURE_MAX_TRANSLATION_PX",
+                    30.0,
+                )),
             )
     if ortho_fit_info.get("applied"):
         print(
@@ -6867,6 +9326,36 @@ def _texture_facade_group(group_records,
             borderValue=0,
         ) > 0
     ortho_fit_display_mask &= rectified_wall_mask
+    refinement_info.update({
+        "optional_ortho_affine_applied_to_rgb_and_semantic_mask": bool(
+            ortho_fit_info.get("applied", False)
+        ),
+        "mask_transform_chain": [
+            "selected_source_full_image",
+            "fitted_wall_projection_with_validated_side_extension",
+            "perspective_rectification_nearest",
+            (
+                "opening_aware_shared_homography_nearest_one_pass"
+                if bool(
+                    (hough_info.get("opening_aware") or {}).get(
+                        "applied", False
+                    )
+                )
+                else (
+                    "validated_side_hough_remap_nearest"
+                    if bool(hough_info.get("guided_warp_applied", False))
+                    else "side_and_opening_rectification_not_applied"
+                )
+            ),
+            "clip_to_projected_wall_after_rectification",
+            "post_hough_roof_structure_removal",
+            (
+                "optional_ortho_affine_nearest"
+                if ortho_fit_info.get("applied", False)
+                else "optional_ortho_affine_not_applied"
+            ),
+        ],
+    })
 
     if SAVE_FACADE_GROUP_DEBUG_PNG or SAVE_ARTIFACT_CONTACT_SHEET:
         _save_ortho_fit_debug_overlay(
@@ -6880,15 +9369,11 @@ def _texture_facade_group(group_records,
             display_mask=ortho_fit_display_mask,
         )
 
-    lama_valid_content_mask = None
-    if post_rectification_sam_enabled and post_sam_refinement_accepted:
-        lama_valid_content_mask = ortho_fit_display_mask
-        refinement_info["used_as_lama_valid_content_mask"] = True
-        refinement_info["lama_valid_content_area_px"] = int(
-            lama_valid_content_mask.sum()
-        )
-    else:
-        refinement_info["used_as_lama_valid_content_mask"] = False
+    lama_valid_content_mask = ortho_fit_display_mask
+    refinement_info["used_as_lama_valid_content_mask"] = True
+    refinement_info["lama_valid_content_area_px"] = int(
+        lama_valid_content_mask.sum()
+    )
 
     if ENABLE_LAMA_FILL:
         lama_mask_path = (
@@ -6919,6 +9404,11 @@ def _texture_facade_group(group_records,
         ortho_rgba_texture[~wall_mask_clip, 3] = 0
     else:
         ortho_rgba_texture = ortho_rgba.copy()
+
+    ortho_rgba_texture = bleed_rgb_into_transparency(
+        ortho_rgba_texture,
+        radius_px=TEXTURE_TRANSPARENT_EDGE_BLEED_PX,
+    )
 
     out_png_ortho = Path(per_building_out) / f"{geojson_base}__{facade_tag}__ortho.png"
     Image.fromarray(ortho_rgba_texture).save(out_png_ortho)
@@ -6953,7 +9443,7 @@ def _texture_facade_group(group_records,
     out_json_ortho = Path(per_building_out) / f"{geojson_base}__{facade_tag}__ortho_meta.json"
     group_meta = {
         "type": "rectified_facade_group_texture",
-        "version": "3.0-projection-first-facade-group",
+        "version": "5.0-opening-aware-side-evidence",
         "geojson": geojson_base,
         "facade_tag": facade_tag,
         "component_id": int(cid) if cid is not None else -1,
@@ -7012,10 +9502,12 @@ def _texture_facade_group(group_records,
                 (osm_occlusion_context or {}).get("excluded_target_buildings", [])
             ),
         },
-        "pre_segmentation_image_space_wireframe_fit": image_space_wireframe_fit,
+        "image_space_wireframe_fit": image_space_wireframe_fit,
         "facade_alignment": facade_alignment_info,
         "parallel_model_depth_boundary_fit": depth_boundary_fit_info,
-        "post_segmentation_depth_aware_region_fit": depth_aware_region_fit_info,
+        "depth_aware_region_fit_using_prefit_semantics": (
+            depth_aware_region_fit_info
+        ),
         "camera_utm_xyz": [float(v) for v in cam.tolist()],
         "camera_elevation": camera_elevation_info,
         "heading_deg": float(heading),
@@ -7030,30 +9522,50 @@ def _texture_facade_group(group_records,
             "pixels_per_meter": float(PIXELS_PER_METER),
             "margin_m": float(MARGIN_METERS),
             "bounds_m": {"xmin": float(xmin), "xmax": float(xmax), "ymin": float(ymin), "ymax": float(ymax)},
-            "bounds_include_selected_alpha": bool(
-                contour_m.shape[0] > 0 and not post_rectification_sam_enabled
-            ),
-            "selected_alpha_points_for_bounds": int(
-                contour_m.shape[0] if not post_rectification_sam_enabled else 0
-            ),
+            "bounds_include_selected_alpha": False,
+            "selected_alpha_points_for_bounds": 0,
             "flip_vertical": bool(flip),
             "H_pix_to_wall_m": [[float(v) for v in row] for row in H_pix_to_wall_m.tolist()],
             "S_m_to_px": [[float(v) for v in row] for row in S_m_to_px.tolist()],
         },
         "lr_alpha_gate": lr_alpha_gate_info,
         "projection_first_extraction": {
-            "enabled": bool(post_rectification_sam_enabled),
-            "source_alpha": (
-                "selected_fitted_wall_outline_minus_external_osm_building_obstruction"
-                if selected_external_building_mask is not None
-                else "selected_fitted_wall_outline"
+            "enabled": True,
+            "semantic_reuse_enabled": bool(
+                reuse_prefit_semantic_mask_enabled
             ),
-            "sam_stage": "after_rectification",
-            "sam_can_expand_outside_projection": False,
-            "sam_empty_fallback": "rectified_projection_mask",
+            "source_alpha": (
+                "reused_full_image_sam3_target_plus_side_candidate_canvas"
+                if refinement_info.get("accepted_for_reuse", False)
+                else "fitted_wall_projection_fallback_plus_side_candidate_canvas"
+            ),
+            "semantic_source_stage": (
+                "selected_source_full_image_before_global_depth_fit"
+            ),
+            "second_facade_segmentation_inference_run": False,
+            "opening_segmentation_inference_run": bool(
+                opening_sam_info.get("reason") == "completed"
+            ),
+            "semantic_mask_can_expand_outside_projection": bool(
+                refinement_info.get(
+                    "side_content_extension_accepted_pixels", 0
+                ) > 0
+            ),
+            "side_extension_is_clipped_after_joint_warp": True,
+            "side_extension_promotion_requires_validated_outside_edge": True,
+            "semantic_empty_fallback": (
+                "fitted_wall_projection_minus_known_and_osm_occluders"
+            ),
+            "external_osm_exclusion_applied": bool(
+                selected_external_building_mask is not None
+            ),
         },
-        "sam3_facade_refinement": refinement_info,
-        "post_rectification_fit": {
+        "prefit_semantic_texture_mask_reuse": refinement_info,
+        "facade_side_evidence": side_evidence_metadata(
+            source_side_evidence
+        ),
+        "opening_sam3": opening_sam_info,
+        "ortho_fit": {
             **ortho_fit_info,
             "target_polygon_px": [[float(x), float(y)] for x, y in wall_poly_px.tolist()],
             "M_fit_2x3": (
@@ -7089,26 +9601,26 @@ def _texture_facade_group(group_records,
                 str(depth_aware_region_fit_overlay_path.name)
                 if depth_aware_region_fit_overlay_path.is_file() else None
             ),
-            "sam3_alpha_overlay_png": (
-                str(sam3_overlay_path.name)
-                if sam3_overlay_path is not None and sam3_overlay_path.is_file()
+            "reused_prefit_semantic_mask_overlay_png": (
+                str(semantic_reuse_overlay_path.name)
+                if semantic_reuse_overlay_path is not None
+                and semantic_reuse_overlay_path.is_file()
                 else None
             ),
-            "sam3_guarded_fit_overlay_png": (
+            "guarded_ortho_fit_overlay_png": (
                 str(ortho_fit_overlay_path.name)
                 if ortho_fit_overlay_path.is_file()
-                else None
-            ),
-            "sam3_instances_overlay_png": (
-                str(sam3_instances_overlay_path.name)
-                if sam3_instances_overlay_path is not None
-                and sam3_instances_overlay_path.is_file()
                 else None
             ),
             "ortho_prefit_overlay_png": str(ortho_prefit_overlay_path.name),
             "ortho_fit_overlay_png": str(ortho_fit_overlay_path.name),
             "hough_overlay_png": str(Path(hough_overlay_path).name) if hough_overlay_path is not None else None,
             "hough_warp_overlay_png": str(Path(hough_warp_overlay_path).name) if hough_warp_overlay_path is not None else None,
+            "opening_aware_overlay_png": (
+                (hough_info.get("opening_aware") or {}).get(
+                    "overlay_png"
+                )
+            ),
             "hough_band_pngs": {
                 str(k): str(Path(v).name)
                 for k, v in hough_band_paths.items()
@@ -7133,7 +9645,7 @@ def _texture_facade_group(group_records,
         q = rec_wall["wall_quad"]
         viewer_rows[gi] = {
             "geojson": geojson_base,
-            "wall_tag": f"c{cid}_l{lid}_w{gi:02d}",
+            "wall_tag": f"c{cid_tag}_l{lid_tag}_w{gi:02d}",
             "facade_group_tag": facade_tag,
             "facade_group_id": int(group_id),
             "facade_group_wall_indices": [int(r["global_index"]) for r in group_records],
@@ -7164,8 +9676,8 @@ def _texture_facade_group(group_records,
             "sv_rgb_jpg": sv_jpg_name,
             "model_depth": depth_artifacts or None,
             "facade_alignment": facade_alignment_info,
-            "projection_first_extraction": bool(post_rectification_sam_enabled),
-            "post_rectification_sam": refinement_info,
+            "projection_first_extraction": True,
+            "prefit_semantic_texture_mask_reuse": refinement_info,
             "model_depth_boundary_fit": depth_boundary_fit_info,
             "model_depth_boundary_fit_artifacts": depth_boundary_artifacts or None,
             "depth_aware_region_fit": depth_aware_region_fit_info,
@@ -7408,6 +9920,7 @@ def process_building(geojson_path: str,
         osm_occlusion_context = _prepare_osm_building_occlusion_context(
             geojson_path,
             base_z,
+            camera_elevation_resolver=camera_elevation_resolver,
         )
     with stage_timer.stage("build facade groups + group debug images"):
         facade_group_items = _collect_facade_group_items(wall_records_by_loop)
@@ -7462,9 +9975,6 @@ def process_building(geojson_path: str,
                 base_z=base_z,
                 pano_records=pano_records,
                 processor=processor,
-                sam3_prompt_facade=sam3_prompt_facade,
-                sam3_prompt_facade_refinement=sam3_prompt_facade_refinement,
-                sam3_prompt_roof=sam3_prompt_roof,
                 mesh_by_name=mesh_by_name,
                 meshes_named=meshes_named,
                 model_boundary_edges_xyz=model_boundary_edges_xyz,
@@ -7472,6 +9982,7 @@ def process_building(geojson_path: str,
                 stage_timer=stage_timer,
                 source_selection_policy=building_source_selection_policy,
                 camera_elevation_resolver=camera_elevation_resolver,
+                loop_records=wall_records_by_loop.get(item.get("loop_key"), []),
             )
             grouped_wall_viewer_rows.update(rows)
         except Exception as e:
@@ -7495,9 +10006,6 @@ def process_building(geojson_path: str,
                     base_z=base_z,
                     pano_records=pano_records,
                     processor=processor,
-                    sam3_prompt_facade=sam3_prompt_facade,
-                    sam3_prompt_facade_refinement=sam3_prompt_facade_refinement,
-                    sam3_prompt_roof=sam3_prompt_roof,
                     mesh_by_name=mesh_by_name,
                     meshes_named=meshes_named,
                     model_boundary_edges_xyz=model_boundary_edges_xyz,
@@ -7505,6 +10013,7 @@ def process_building(geojson_path: str,
                     stage_timer=stage_timer,
                     source_selection_policy=building_source_selection_policy,
                     camera_elevation_resolver=camera_elevation_resolver,
+                    loop_records=wall_records_by_loop.get((_cid, _lid), []),
                 )
                 grouped_wall_viewer_rows.update(rows)
             except Exception as e:
@@ -8184,6 +10693,11 @@ def process_building(geojson_path: str,
             else:
                 ortho_rgba_texture = ortho_rgba.copy()
 
+            ortho_rgba_texture = bleed_rgb_into_transparency(
+                ortho_rgba_texture,
+                radius_px=TEXTURE_TRANSPARENT_EDGE_BLEED_PX,
+            )
+
             Image.fromarray(ortho_rgba_texture).save(out_png_ortho)
 
             ortho_overlay_path = Path(per_building_out) / name_for(
@@ -8433,24 +10947,112 @@ def process_building(geojson_path: str,
             print(f"WARNING: Roof texture (masked) failed ({e}); keeping white roof.")
 
 
-    # --------------------- Export Scene as GLB ---------------------
+    # --------------------- Final base repair + export ---------------------
     stage_timer.record("roof texture update", time.perf_counter() - roof_texture_t0)
+    base_repair_t0 = time.perf_counter()
+    posttexture_meshes_named = meshes_named
+    posttexture_base_repair_info = {
+        "version": "1.0",
+        "stage": "after_texture_generation_before_final_export",
+        "applied": False,
+        "reason": "disabled_by_configuration",
+    }
+    if bool(ENABLE_POSTTEXTURE_BASE_LEVEL_REPAIR):
+        finished_wall_records = [
+            record
+            for records in wall_records_by_loop.values()
+            for record in records
+        ]
+        posttexture_meshes_named, posttexture_base_repair_info = (
+            level_finished_building_base(
+                meshes_named,
+                finished_wall_records,
+                level_tolerance_m=POSTTEXTURE_BASE_LEVEL_TOLERANCE_M,
+                dominant_color_bits=(
+                    POSTTEXTURE_EXTENSION_DOMINANT_COLOR_BITS
+                ),
+                maximum_color_samples=(
+                    POSTTEXTURE_EXTENSION_MAX_COLOR_SAMPLES
+                ),
+            )
+        )
+        if posttexture_base_repair_info.get("applied", False):
+            print(
+                "Post-texture base repair: extended "
+                f"{posttexture_base_repair_info['wall_extension_meshes_added']} "
+                "wall side(s) to the global minimum z="
+                f"{posttexture_base_repair_info['minimum_base_z_m']:.3f} m "
+                "and replaced/created "
+                f"{posttexture_base_repair_info['base_meshes_replaced'] + posttexture_base_repair_info['base_meshes_created']} "
+                "flat base surface(s)."
+            )
+            if not posttexture_base_repair_info.get(
+                "geometry_complete", False
+            ):
+                print(
+                    "WARNING: Post-texture base repair could not close every "
+                    "required wall/base fragment; inspect "
+                    "posttexture_base_repair.json."
+                )
+        else:
+            print(
+                "Post-texture base repair made no geometry changes "
+                f"({posttexture_base_repair_info.get('reason', 'unknown')})."
+            )
+    base_repair_path = Path(per_building_out) / "posttexture_base_repair.json"
+    with open(base_repair_path, "w", encoding="utf-8") as f:
+        json.dump(
+            posttexture_base_repair_info,
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    stage_timer.record(
+        "post-texture base level repair",
+        time.perf_counter() - base_repair_t0,
+    )
+
     export_t0 = time.perf_counter()
-    if meshes_named:
+    export_source_meshes_named, topology_repair_info = repair_mesh_t_junctions(
+        posttexture_meshes_named,
+    )
+    if (
+        topology_repair_info["degenerate_faces_removed"]
+        or topology_repair_info["boundary_edges_split"]
+    ):
+        print(
+            "Repaired export mesh topology: "
+            f"removed {topology_repair_info['degenerate_faces_removed']} "
+            "zero-area face(s), split "
+            f"{topology_repair_info['boundary_edges_split']} "
+            "T-junction edge(s)."
+        )
+
+    if export_source_meshes_named:
         geojson_stem = os.path.splitext(os.path.basename(geojson_path))[0]
         export_origin_epsg = None
-        export_meshes_named = meshes_named
+        export_meshes_named = export_source_meshes_named
         if GLB_EXPORT_LOCAL_COORDINATES:
-            export_origin_epsg = _make_export_origin(meshes_named, relative_to_ground=False)
+            export_origin_epsg = _make_export_origin(
+                export_source_meshes_named,
+                relative_to_ground=False,
+            )
             if export_origin_epsg is not None:
-                export_meshes_named = _copy_meshes_for_local_y_up(meshes_named, export_origin_epsg)
+                export_meshes_named = _copy_meshes_for_local_y_up(
+                    export_source_meshes_named,
+                    export_origin_epsg,
+                )
 
         scene = trimesh.Scene()
         for name, m in export_meshes_named:
             scene.add_geometry(m, node_name=name)
         glb_path = Path(per_building_out) / name_for("glb", base=geojson_stem)
         scene.export(glb_path)
-        asset_extras = {"crs": SOURCE_CRS}
+        asset_extras = {
+            "crs": SOURCE_CRS,
+            "mesh_topology_repair": topology_repair_info,
+            "posttexture_base_repair": posttexture_base_repair_info,
+        }
         if GLB_EXPORT_LOCAL_COORDINATES and export_origin_epsg is not None:
             asset_extras.update({
                 "coordinates": "local_gltf_y_up",
@@ -8460,11 +11062,15 @@ def process_building(geojson_path: str,
         else:
             asset_extras["coordinates"] = f"direct_{str(SOURCE_CRS).lower()}"
         if patch_glb_materials_double_sided(glb_path, asset_extras=asset_extras):
-            print("Patched GLB materials to double-sided.")
+            print("Patched GLB materials to opaque, matte, and double-sided.")
         print(f"\nExported textured GLB: {glb_path}")
         if EXPORT_KMZ:
             kmz_path = Path(per_building_out) / name_for("kmz", base=geojson_stem)
-            saved_kmz = _save_textured_kmz(meshes_named, kmz_path, name=geojson_stem)
+            saved_kmz = _save_textured_kmz(
+                export_source_meshes_named,
+                kmz_path,
+                name=geojson_stem,
+            )
             if saved_kmz is not None:
                 print(f"Exported textured KMZ: {saved_kmz}")
     else:

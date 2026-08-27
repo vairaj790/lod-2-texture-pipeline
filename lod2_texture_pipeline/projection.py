@@ -1356,14 +1356,17 @@ def _facade_source_selection_key(
     nondegenerate = metric.get("nondegenerate_projection")
     if nondegenerate is None:
         nondegenerate = bool(metric.get("projection_topology_valid", False))
+    candidate_usable = bool(src.get("depth_global_candidate_usable", True))
+    semantic_visibility = dict(src.get("depth_global_target_visibility") or {})
     visibility = _target_visibility_selection_terms(src, metric)
     external_available = bool(visibility["external_visibility_available"])
     external_fraction = float(visibility["external_occlusion_fraction"])
-    # OSM visibility is a reduction of the otherwise usable target-wall
-    # visibility, not a hard clear/blocked gate. A nearly complete wall with a
-    # small obstruction must beat a clear view that contains only a small
-    # fraction of the wall.
+    # Below the near-total rejection threshold, OSM visibility remains a soft
+    # reduction of otherwise usable target-wall visibility. A nearly complete
+    # wall with a small obstruction should still beat a clear image containing
+    # only a small fraction of the wall.
     return (
+        1 if candidate_usable else 0,
         1 if nondegenerate else 0,
         1 if metric.get("projection_topology_valid", False) else 0,
         1 if visibility["available"] else 0,
@@ -1372,6 +1375,8 @@ def _facade_source_selection_key(
         -external_fraction,
         float(visibility["usable_visibility_fraction"]),
         float(visibility["self_visibility_fraction"]),
+        float(semantic_visibility.get("combined_visible_fraction", 1.0)),
+        float(semantic_visibility.get("target_support_fraction", 0.0)),
         1 if visibility["fully_visible"] else 0,
         1 if legacy_preference else 0,
         1 if metric.get("full_frame_coverage", False) else 0,
@@ -1533,6 +1538,21 @@ def _build_selected_facade_source_result(
             "depth_global_score_improvement": float(
                 source.get("depth_global_score_improvement", 0.0)
             ),
+            "depth_global_candidate_usable": bool(
+                source.get("depth_global_candidate_usable", True)
+            ),
+            "depth_global_candidate_rejection_reason": source.get(
+                "depth_global_candidate_rejection_reason"
+            ),
+            "depth_global_target_visibility": dict(
+                source.get("depth_global_target_visibility") or {}
+            ),
+            "depth_global_sam3_skipped": bool(
+                source.get("depth_global_sam3_skipped", False)
+            ),
+            "depth_global_sam3_skip_reason": source.get(
+                "depth_global_sam3_skip_reason"
+            ),
             "external_building_occlusion_available": bool(
                 source.get("external_building_occlusion_available", False)
             ),
@@ -1541,11 +1561,31 @@ def _build_selected_facade_source_result(
                 if source.get("external_building_occlusion_available", False)
                 else None
             ),
+            "external_building_raw_projection_occlusion_fraction": (
+                float(source.get(
+                    "external_building_raw_projection_occlusion_fraction",
+                    0.0,
+                ))
+                if source.get("external_building_occlusion_available", False)
+                else None
+            ),
             "external_building_clear": bool(
                 source.get("external_building_clear", False)
             ),
             "external_building_candidate_blockers": list(
                 source.get("external_building_candidate_blockers", [])
+            ),
+            "external_building_candidate_blocker_terrain": dict(
+                source.get(
+                    "external_building_candidate_blocker_terrain",
+                    {},
+                )
+            ),
+            "external_building_blocker_terrain_source": str(
+                source.get(
+                    "external_building_blocker_terrain_source",
+                    "not_available",
+                )
             ),
             "full_frame_coverage": bool(metric.get("full_frame_coverage", False)),
             "coverage_fraction": float(metric.get("coverage_fraction", 0.0)),
@@ -1642,6 +1682,10 @@ def _build_selected_facade_source_result(
         "selected_candidate_prefit_semantic_guidance": selected_src.get(
             "depth_global_prefit_semantic_guidance"
         ),
+        "selected_candidate_fit_semantic_guidance": selected_src.get(
+            "depth_global_fit_semantic_guidance",
+            selected_src.get("depth_global_prefit_semantic_guidance"),
+        ),
         "selected_candidate_prefit_semantic_metadata": selected_src.get(
             "depth_global_prefit_semantic_metadata"
         ),
@@ -1663,6 +1707,18 @@ def _build_selected_facade_source_result(
             ),
             "candidate_blockers": list(
                 selected_src.get("external_building_candidate_blockers", [])
+            ),
+            "candidate_blocker_terrain": dict(
+                selected_src.get(
+                    "external_building_candidate_blocker_terrain",
+                    {},
+                )
+            ),
+            "terrain_source": str(
+                selected_src.get(
+                    "external_building_blocker_terrain_source",
+                    "not_available",
+                )
             ),
             "reason": str(
                 selected_src.get("external_building_occlusion_reason", "not_evaluated")
@@ -1823,6 +1879,21 @@ def select_facade_source_from_panos(geom,
                 f"[{facade_tag}] candidate preselection evaluation failed; "
                 f"using raw source ranking: {exc}"
             )
+
+    evaluated_candidates = [
+        source for source in sources
+        if bool(source.get("depth_global_fit_evaluated_before_selection", False))
+    ]
+    if (
+        evaluated_candidates
+        and not any(bool(source.get("depth_global_candidate_usable", True))
+                    for source in evaluated_candidates)
+    ):
+        print(
+            f"[{facade_tag}] every projected source candidate is OSM- or "
+            "semantic-occlusion rejected; leaving this facade unresolved."
+        )
+        return None
 
     image_size = sources[0]["img"].size
     metrics = _facade_source_metrics(sources, outline_xyz, image_size)
