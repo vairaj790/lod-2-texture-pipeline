@@ -3,9 +3,15 @@
 
 The texture pipeline must use the source wall geometry unchanged while it
 selects imagery and rectifies facade textures.  This module therefore operates
-only on the finished meshes: it leaves every original wall in place, adds a
-solid-colour strip below walls whose base is above the building-wide minimum,
-and recreates the underside at that minimum elevation.
+only on the finished meshes: it leaves every original wall in place, extends
+the wall appearance below bases that are above the building-wide minimum, and
+recreates the underside at that elevation.
+
+Textured extensions reuse a narrow band immediately inside the source wall's
+bottom UV edge.  Besides making the join spatially continuous, this keeps the
+extension on the same sRGB texture/material path as the wall.  Copying sampled
+texture bytes into linear vertex colours makes the extension render much
+brighter even when the numeric RGB values are identical.
 """
 
 from collections import defaultdict
@@ -19,6 +25,9 @@ from shapely.ops import triangulate
 
 DEFAULT_EXTENSION_RGBA = (240, 240, 240, 255)
 DEFAULT_BASE_RGBA = (240, 240, 240, 255)
+DEFAULT_SEAM_BAND_FRACTION = 0.04
+DEFAULT_SEAM_BAND_MIN_TEXELS = 8.0
+DEFAULT_SEAM_BAND_MAX_TEXELS = 24.0
 
 
 def _texture_image(mesh):
@@ -49,6 +58,93 @@ def _valid_uv(mesh):
     if uv.shape != (len(mesh.vertices), 2) or not np.isfinite(uv).all():
         return None
     return uv
+
+
+def _source_wall_quad_uv(mesh, wall_quad):
+    """Map ``[b1, b2, t2, t1]`` wall points to the mesh UV vertices."""
+    uv = _valid_uv(mesh)
+    vertices = np.asarray(getattr(mesh, "vertices", []), dtype=np.float64)
+    quad = np.asarray(wall_quad, dtype=np.float64)
+    if (
+        uv is None
+        or vertices.ndim != 2
+        or vertices.shape[1] != 3
+        or len(vertices) == 0
+        or quad.shape != (4, 3)
+        or not np.isfinite(vertices).all()
+        or not np.isfinite(quad).all()
+    ):
+        return None
+
+    extent = float(np.linalg.norm(np.ptp(vertices, axis=0)))
+    position_tolerance = max(1.0e-6, extent * 1.0e-7)
+    indices = []
+    for point in quad:
+        distances = np.linalg.norm(vertices - point, axis=1)
+        index = int(np.argmin(distances))
+        if not np.isfinite(distances[index]) or distances[index] > position_tolerance:
+            return None
+        indices.append(index)
+    return uv[np.asarray(indices, dtype=np.int64)].copy()
+
+
+def _source_wall_seam_texture_spec(
+    mesh,
+    wall_quad,
+    *,
+    seam_band_fraction=DEFAULT_SEAM_BAND_FRACTION,
+    minimum_seam_band_texels=DEFAULT_SEAM_BAND_MIN_TEXELS,
+    maximum_seam_band_texels=DEFAULT_SEAM_BAND_MAX_TEXELS,
+):
+    """Describe a narrow source-texture band immediately above a wall base."""
+    image = _texture_image(mesh)
+    quad_uv = _source_wall_quad_uv(mesh, wall_quad)
+    if image is None or quad_uv is None:
+        return None
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        return None
+
+    bottom_uv = quad_uv[:2].copy()
+    upper_uv = quad_uv[[3, 2]].copy()
+    texture_scale = np.asarray(
+        [max(1, width - 1), max(1, height - 1)],
+        dtype=np.float64,
+    )
+    span_texels = np.linalg.norm((upper_uv - bottom_uv) * texture_scale, axis=1)
+    fraction = max(0.0, float(seam_band_fraction))
+    minimum_texels = max(0.0, float(minimum_seam_band_texels))
+    maximum_texels = max(minimum_texels, float(maximum_seam_band_texels))
+    inward_fractions = np.zeros(2, dtype=np.float64)
+    actual_band_texels = np.zeros(2, dtype=np.float64)
+    for index, span in enumerate(span_texels):
+        if not np.isfinite(span) or span <= 1.0e-9:
+            return None
+        desired = float(np.clip(fraction * span, minimum_texels, maximum_texels))
+        # Tiny wall textures should not contribute pixels from far up the
+        # facade merely to satisfy the normal minimum band width.
+        inward_fractions[index] = min(0.25, desired / span)
+        actual_band_texels[index] = inward_fractions[index] * span
+    inward_uv = bottom_uv + inward_fractions[:, None] * (upper_uv - bottom_uv)
+
+    visual = getattr(mesh, "visual", None)
+    material = getattr(visual, "material", None)
+    material_image = None
+    if material is not None:
+        material_image = getattr(material, "image", None)
+        if material_image is None:
+            material_image = getattr(material, "baseColorTexture", None)
+    if material_image is None:
+        material = None
+    return {
+        "image": image,
+        "material": material,
+        "bottom_uv": bottom_uv,
+        "inward_uv": inward_uv,
+        "source_texture_size_px": [int(width), int(height)],
+        "band_depth_texels": [float(value) for value in actual_band_texels],
+        "band_depth_fraction": [float(value) for value in inward_fractions],
+    }
 
 
 def _mode_rgba(colors, fallback_rgba=DEFAULT_EXTENSION_RGBA):
@@ -231,6 +327,133 @@ def dominant_wall_texture_rgba(
     }
 
 
+def wall_bottom_seam_texture_rgba(
+    mesh,
+    wall_quad,
+    *,
+    quantization_bits=5,
+    maximum_samples=500_000,
+    minimum_alpha=1,
+    fallback_rgba=DEFAULT_EXTENSION_RGBA,
+    seam_band_fraction=DEFAULT_SEAM_BAND_FRACTION,
+    minimum_seam_band_texels=DEFAULT_SEAM_BAND_MIN_TEXELS,
+    maximum_seam_band_texels=DEFAULT_SEAM_BAND_MAX_TEXELS,
+):
+    """Return the representative colour and texture band at the wall join.
+
+    The colour is retained for audit/fallback metadata.  When a texture band
+    exists, the extension itself uses that band rather than this single value.
+    """
+    fallback = _visual_fallback_rgba(mesh, fallback_rgba)
+    spec = _source_wall_seam_texture_spec(
+        mesh,
+        wall_quad,
+        seam_band_fraction=seam_band_fraction,
+        minimum_seam_band_texels=minimum_seam_band_texels,
+        maximum_seam_band_texels=maximum_seam_band_texels,
+    )
+    if spec is None:
+        return fallback, None, {
+            "source": "source_wall_visual_fallback",
+            "covered_opaque_pixels": 0,
+            "sampled_pixels": 0,
+        }
+
+    image = spec["image"]
+    width, height = image.size
+    band_uv = np.vstack([
+        spec["bottom_uv"][0],
+        spec["bottom_uv"][1],
+        spec["inward_uv"][1],
+        spec["inward_uv"][0],
+    ])
+    band_pixels = np.empty_like(band_uv, dtype=np.float64)
+    band_pixels[:, 0] = band_uv[:, 0] * float(width)
+    band_pixels[:, 1] = (1.0 - band_uv[:, 1]) * float(height)
+    min_x = max(0, int(np.floor(np.min(band_pixels[:, 0]))))
+    min_y = max(0, int(np.floor(np.min(band_pixels[:, 1]))))
+    max_x = min(width - 1, int(np.ceil(np.max(band_pixels[:, 0]))))
+    max_y = min(height - 1, int(np.ceil(np.max(band_pixels[:, 1]))))
+    if min_x > max_x or min_y > max_y:
+        return fallback, None, {
+            "source": "source_wall_visual_fallback",
+            "covered_opaque_pixels": 0,
+            "sampled_pixels": 0,
+        }
+
+    crop_width = max_x - min_x + 1
+    crop_height = max_y - min_y + 1
+    mask_image = Image.new("L", (crop_width, crop_height), 0)
+    draw = ImageDraw.Draw(mask_image, "L")
+    offset = np.asarray([float(min_x), float(min_y)], dtype=np.float64)
+    draw.polygon(
+        [tuple(float(value) for value in point) for point in band_pixels - offset],
+        fill=255,
+    )
+    rgba = np.asarray(
+        image.crop((min_x, min_y, max_x + 1, max_y + 1)),
+        dtype=np.uint8,
+    )
+    mask = np.asarray(mask_image, dtype=np.uint8) > 0
+    valid = mask & (rgba[:, :, 3] >= int(minimum_alpha))
+    pixels = rgba[valid]
+    opaque_count = int(len(pixels))
+    sampling_source = "uv_bottom_seam_texture_mode"
+    if len(pixels) == 0:
+        covered = rgba[mask]
+        pixels = covered[np.any(covered[:, :3] != 0, axis=1)]
+        sampling_source = "uv_bottom_seam_hidden_rgb_mode"
+    candidate_count = int(len(pixels))
+    if candidate_count == 0:
+        return fallback, None, {
+            "source": "source_wall_visual_fallback",
+            "covered_opaque_pixels": 0,
+            "sampled_pixels": 0,
+        }
+
+    maximum_samples = max(1, int(maximum_samples))
+    if len(pixels) > maximum_samples:
+        sample_indices = np.linspace(
+            0,
+            len(pixels) - 1,
+            num=maximum_samples,
+            dtype=np.int64,
+        )
+        sampled = pixels[sample_indices]
+    else:
+        sampled = pixels
+
+    bits = min(8, max(1, int(quantization_bits)))
+    shift = 8 - bits
+    rgb = sampled[:, :3].astype(np.uint32)
+    quantized = rgb >> shift
+    keys = (
+        (quantized[:, 0] << (2 * bits))
+        | (quantized[:, 1] << bits)
+        | quantized[:, 2]
+    )
+    unique_keys, counts = np.unique(keys, return_counts=True)
+    winning_key = unique_keys[int(np.argmax(counts))]
+    winning_pixels = sampled[keys == winning_key, :3]
+    color = np.clip(
+        np.rint(np.median(winning_pixels.astype(np.float64), axis=0)),
+        0,
+        255,
+    ).astype(np.uint8)
+    rgba_out = int(color[0]), int(color[1]), int(color[2]), 255
+    return rgba_out, spec, {
+        "source": sampling_source,
+        "covered_opaque_pixels": opaque_count,
+        "candidate_pixels": candidate_count,
+        "sampled_pixels": int(len(sampled)),
+        "quantization_bits": bits,
+        "winning_bin_pixels": int(len(winning_pixels)),
+        "source_texture_size_px": list(spec["source_texture_size_px"]),
+        "band_depth_texels": list(spec["band_depth_texels"]),
+        "band_depth_fraction": list(spec["band_depth_fraction"]),
+    }
+
+
 def _is_base_mesh_name(name):
     lowered = str(name).strip().lower()
     return lowered == "base" or lowered.startswith("base_")
@@ -285,6 +508,7 @@ def _make_wall_extension_mesh(
     minimum_z,
     rgba,
     *,
+    seam_texture_spec=None,
     area_tolerance=1.0e-12,
 ):
     top_1 = quad[0].copy()
@@ -306,7 +530,7 @@ def _make_wall_extension_mesh(
     )
     faces = faces[np.isfinite(twice_area) & (twice_area > float(area_tolerance))]
     if len(faces) == 0:
-        return None
+        return None, None
 
     expected = _wall_outward_normal(record, source_mesh)
     combined_normal = np.sum(
@@ -319,19 +543,81 @@ def _make_wall_extension_mesh(
     if float(np.dot(combined_normal, expected)) < 0.0:
         faces = faces[:, [0, 2, 1]]
 
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    mesh.remove_unreferenced_vertices()
-    mesh.visual.face_colors = np.tile(
-        np.asarray(rgba, dtype=np.uint8).reshape(1, 4),
-        (len(faces), 1),
+    appearance_info = {
+        "mode": "source_wall_visual_fallback",
+        "source_material_reused": False,
+    }
+    full_uv = None
+    if seam_texture_spec is not None:
+        bottom_uv = np.asarray(seam_texture_spec["bottom_uv"], dtype=np.float64)
+        inward_uv = np.asarray(seam_texture_spec["inward_uv"], dtype=np.float64)
+        full_uv = np.vstack([
+            inward_uv[0],
+            inward_uv[1],
+            bottom_uv[1],
+            bottom_uv[0],
+        ])
+        # At the collapsed end of a triangular wedge, the one shared vertex
+        # belongs to the join. Give seam continuity priority over the inward
+        # band coordinate that would otherwise be attached to the same point.
+        extension_heights = quad[:2, 2] - float(minimum_z)
+        if extension_heights[0] <= 1.0e-12:
+            full_uv[0] = bottom_uv[0]
+            full_uv[3] = bottom_uv[0]
+        if extension_heights[1] <= 1.0e-12:
+            full_uv[1] = bottom_uv[1]
+            full_uv[2] = bottom_uv[1]
+
+    # Compact geometry and UVs together after removing a collapsed wedge
+    # triangle. This avoids assigning the inward coordinate to the seam-only
+    # vertex at the zero-height end.
+    referenced = np.unique(faces.reshape(-1))
+    remap = np.full(len(vertices), -1, dtype=np.int64)
+    remap[referenced] = np.arange(len(referenced), dtype=np.int64)
+    compact_vertices = vertices[referenced]
+    compact_faces = remap[faces]
+    mesh = trimesh.Trimesh(
+        vertices=compact_vertices,
+        faces=compact_faces,
+        process=False,
     )
+    if full_uv is not None:
+        compact_uv = full_uv[referenced]
+        material = seam_texture_spec.get("material")
+        if material is not None:
+            mesh.visual = trimesh.visual.texture.TextureVisuals(
+                uv=compact_uv,
+                material=material,
+            )
+        else:
+            mesh.visual = trimesh.visual.texture.TextureVisuals(
+                uv=compact_uv,
+                image=seam_texture_spec["image"],
+            )
+        appearance_info = {
+            "mode": "source_wall_bottom_texture_band",
+            "source_material_reused": bool(material is not None),
+            "source_texture_size_px": list(
+                seam_texture_spec["source_texture_size_px"]
+            ),
+            "band_depth_texels": list(seam_texture_spec["band_depth_texels"]),
+            "band_depth_fraction": list(
+                seam_texture_spec["band_depth_fraction"]
+            ),
+        }
+    else:
+        mesh.visual.face_colors = np.tile(
+            np.asarray(rgba, dtype=np.uint8).reshape(1, 4),
+            (len(compact_faces), 1),
+        )
     mesh.metadata.update({
         "posttexture_base_extension": True,
         "source_wall_mesh": str(record.get("mesh_name")),
         "minimum_base_z_m": float(minimum_z),
         "dominant_wall_rgba": [int(value) for value in rgba],
+        "extension_appearance": str(appearance_info["mode"]),
     })
-    return mesh
+    return mesh, appearance_info
 
 
 def _flatten_base_mesh(mesh, minimum_z):
@@ -446,13 +732,18 @@ def level_finished_building_base(
     dominant_color_bits=5,
     maximum_color_samples=500_000,
     fallback_rgba=DEFAULT_EXTENSION_RGBA,
+    seam_band_fraction=DEFAULT_SEAM_BAND_FRACTION,
+    minimum_seam_band_texels=DEFAULT_SEAM_BAND_MIN_TEXELS,
+    maximum_seam_band_texels=DEFAULT_SEAM_BAND_MAX_TEXELS,
 ):
     """Level an uneven base after textures are final and before mesh export.
 
     Original wall meshes are never moved or re-UVed.  If all base elevations
     already agree within ``level_tolerance_m``, the original list object is
-    returned unchanged.  Otherwise newly coloured wall-extension meshes and a
-    flat replacement underside are returned with an audit dictionary.
+    returned unchanged. Otherwise wall-extension meshes and a flat replacement
+    underside are returned with an audit dictionary. Textured walls extend a
+    narrow strip of their own bottom-edge texture; only genuinely untextured
+    walls use a solid visual fallback.
     """
     meshes_named = list(meshes_named) if not isinstance(meshes_named, list) else meshes_named
     wall_records = list(wall_records or [])
@@ -460,7 +751,7 @@ def level_finished_building_base(
     elevations = _base_elevations(meshes_named, valid_records)
     tolerance = max(0.0, float(level_tolerance_m))
     info = {
-        "version": "1.0",
+        "version": "1.1",
         "stage": "after_texture_generation_before_final_export",
         "applied": False,
         "geometry_complete": False,
@@ -526,18 +817,23 @@ def level_finished_building_base(
             continue
         if float(np.max(quad[:2, 2] - minimum_z)) <= 1.0e-12:
             continue
-        rgba, color_info = dominant_wall_texture_rgba(
+        rgba, seam_texture_spec, color_info = wall_bottom_seam_texture_rgba(
             source_mesh,
+            quad,
             quantization_bits=dominant_color_bits,
             maximum_samples=maximum_color_samples,
             fallback_rgba=fallback_rgba,
+            seam_band_fraction=seam_band_fraction,
+            minimum_seam_band_texels=minimum_seam_band_texels,
+            maximum_seam_band_texels=maximum_seam_band_texels,
         )
-        extension = _make_wall_extension_mesh(
+        extension, appearance_info = _make_wall_extension_mesh(
             record,
             quad,
             source_mesh,
             minimum_z,
             rgba,
+            seam_texture_spec=seam_texture_spec,
         )
         if extension is None:
             continue
@@ -557,6 +853,7 @@ def level_finished_building_base(
             ],
             "rgba": [int(value) for value in rgba],
             "color_sampling": color_info,
+            "appearance": appearance_info,
             "triangles": int(len(extension.faces)),
         })
 

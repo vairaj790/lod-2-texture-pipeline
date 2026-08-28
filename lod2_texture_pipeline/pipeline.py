@@ -10952,7 +10952,7 @@ def process_building(geojson_path: str,
     base_repair_t0 = time.perf_counter()
     posttexture_meshes_named = meshes_named
     posttexture_base_repair_info = {
-        "version": "1.0",
+        "version": "1.1",
         "stage": "after_texture_generation_before_final_export",
         "applied": False,
         "reason": "disabled_by_configuration",
@@ -10973,6 +10973,15 @@ def process_building(geojson_path: str,
                 ),
                 maximum_color_samples=(
                     POSTTEXTURE_EXTENSION_MAX_COLOR_SAMPLES
+                ),
+                seam_band_fraction=(
+                    POSTTEXTURE_EXTENSION_SEAM_BAND_FRACTION
+                ),
+                minimum_seam_band_texels=(
+                    POSTTEXTURE_EXTENSION_SEAM_BAND_MIN_TEXELS
+                ),
+                maximum_seam_band_texels=(
+                    POSTTEXTURE_EXTENSION_SEAM_BAND_MAX_TEXELS
                 ),
             )
         )

@@ -98,12 +98,16 @@ GLB_EXPORT_LOCAL_COORDINATES = True
 EXPORT_KMZ = True
 KML_ALTITUDE_MODE = "relativeToGround"
 # Final-export geometry repair. Texture generation continues to use the
-# original LiDAR wall geometry; only the finished export receives solid-colour
-# wall skirts down to the building-wide minimum base elevation and a flat base.
+# original LiDAR wall geometry; only the finished export receives wall skirts
+# down to the building-wide minimum base elevation and a flat base. Textured
+# skirts reuse the source wall appearance directly above their join.
 ENABLE_POSTTEXTURE_BASE_LEVEL_REPAIR = True
 POSTTEXTURE_BASE_LEVEL_TOLERANCE_M = 0.001
 POSTTEXTURE_EXTENSION_DOMINANT_COLOR_BITS = 5
 POSTTEXTURE_EXTENSION_MAX_COLOR_SAMPLES = 500_000
+POSTTEXTURE_EXTENSION_SEAM_BAND_FRACTION = 0.04
+POSTTEXTURE_EXTENSION_SEAM_BAND_MIN_TEXELS = 8.0
+POSTTEXTURE_EXTENSION_SEAM_BAND_MAX_TEXELS = 24.0
 SAVE_FACADE_GROUP_DEBUG_PNG = True
 FACADE_GROUP_ALLOW_PER_WALL_FALLBACK = False
 FACADE_GROUP_MAX_LINE_DEVIATION_M = 1.25
